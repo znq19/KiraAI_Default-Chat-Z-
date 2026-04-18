@@ -33,7 +33,17 @@ class DebouncePlugin(BasePlugin):
         logger.info(f"[Debounce] enabled (group media/forward control, private unchanged)")
 
     async def terminate(self):
-        pass
+        """清理所有未完成的 debounce 任务，防止资源泄漏"""
+        # 取消所有会话的 debounce 循环任务
+        for sid, task in list(self.session_tasks.items()):
+            if not task.done():
+                task.cancel()
+        # 等待所有任务真正取消（可选，确保资源释放）
+        if self.session_tasks:
+            await asyncio.gather(*self.session_tasks.values(), return_exceptions=True)
+        self.session_tasks.clear()
+        self.session_events.clear()
+        logger.debug("[Debounce] All debounce tasks cancelled")
 
     # ========== 新增：图片/表情/转发处理函数（仅群聊调用） ==========
     def _process_media(self, chain, is_mentioned: bool):
@@ -116,22 +126,30 @@ class DebouncePlugin(BasePlugin):
 
     async def _debounce_loop(self, sid: str):
         event = self.session_events[sid]
-        while True:
-            await event.wait()
-            event.clear()
-            try:
-                await asyncio.sleep(self.debounce_interval)
-            except asyncio.CancelledError:
-                break
-            if event.is_set() and not self.receive_unmentioned:
-                continue
-            buffer_len = self.ctx.message_processor.get_session_buffer_length(sid)
-            if buffer_len == 0:
-                continue
-            try:
-                await self.ctx.message_processor.flush_session_messages(sid)
-            except Exception:
-                logger.exception(f"[Debounce] Error flushing session {sid}")
+        try:
+            while True:
+                await event.wait()
+                event.clear()
+                try:
+                    await asyncio.sleep(self.debounce_interval)
+                except asyncio.CancelledError:
+                    break
+                if event.is_set() and not self.receive_unmentioned:
+                    continue
+                buffer_len = self.ctx.message_processor.get_session_buffer_length(sid)
+                if buffer_len == 0:
+                    continue
+                try:
+                    await self.ctx.message_processor.flush_session_messages(sid)
+                except Exception:
+                    logger.exception(f"[Debounce] Error flushing session {sid}")
+        except asyncio.CancelledError:
+            # 任务被取消时正常退出，无需额外处理
+            logger.debug(f"[Debounce] Debounce loop for session {sid} cancelled")
+        finally:
+            # 清理会话相关的资源
+            self.session_tasks.pop(sid, None)
+            self.session_events.pop(sid, None)
 
     @on.llm_request(priority=Priority.MEDIUM)
     async def inject_group_prompt(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
