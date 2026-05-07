@@ -1,6 +1,6 @@
 {
     "display_name": "Default Chat（z）",
-    "plugin_id": "default-chat",
+    "plugin_id": "default-chat（z）",
     "version": "1.3.0",
     "author": "KiraAI+znq19",
     "description": "Default IM Chat processing implementation, merge messages received in a certain duration & add unmentioned messages as context",
