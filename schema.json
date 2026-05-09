@@ -61,5 +61,24 @@
     "type": "switch",
     "default": true,
     "hint": "为true时，只有唤醒消息中的合并转发消息会被展开显示详细内容；非唤醒消息中的转发消息替换为[转发消息]。为false时，所有转发消息都展开（注意：可能消耗较多token）。"
+  },
+  "voice_recognition_only_on_mention": {
+    "name": "仅唤醒消息识别语音（群聊）",
+    "type": "switch",
+    "default": true,
+    "hint": "为true时，只有唤醒消息中的语音会尝试识别；非唤醒消息中的语音替换为[语音]。"
+  },
+  "voice_private_need_mention": {
+    "name": "私聊需要引用才识别语音",
+    "type": "switch",
+    "default": true,
+    "hint": "为true时，私聊中只有引用机器人（回复）的语音才尝试识别；为false时，私聊中所有语音都尝试识别（需STT模型）。"
+  },
+  "voice_max_duration": {
+    "name": "语音最大识别时长（秒）",
+    "type": "integer",
+    "default": 0,
+    "minimum": 0,
+    "hint": "仅当语音时长不超过此值时才会尝试识别（0表示不限制）。超过此秒数的语音会直接替换为[长语音 X秒]。"
   }
 }
