@@ -4,7 +4,7 @@ import random
 from core.plugin import BasePlugin, logger, on, Priority
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.provider import LLMRequest
-from core.chat.message_elements import Text, Image, Reply, Sticker, Forward
+from core.chat.message_elements import Text, Image, Reply, Sticker, Forward, Record
 
 
 class DebouncePlugin(BasePlugin):
@@ -23,36 +23,36 @@ class DebouncePlugin(BasePlugin):
 
         self.waking_words = cfg.get("waking_words", [])
 
-        # ========== 新增：图片/表情/转发消息处理配置（仅群聊） ==========
+        # 图片/表情/转发消息处理配置
         self.image_recognition_only_on_mention = cfg.get("image_recognition_only_on_mention", True)
         self.image_recognition_probability = float(cfg.get("image_recognition_probability", 0.5))
         self.max_images_per_message = int(cfg.get("max_images_per_message", 3))
         self.forward_recognition_only_on_mention = cfg.get("forward_recognition_only_on_mention", True)
 
+        # 语音消息处理配置
+        self.voice_recognition_only_on_mention = cfg.get("voice_recognition_only_on_mention", True)
+        self.voice_private_need_mention = cfg.get("voice_private_need_mention", True)  # 私聊是否需要@/回复
+        self.voice_max_duration = int(cfg.get("voice_max_duration", 0))
+
     async def initialize(self):
-        logger.info(f"[Debounce] enabled (group media/forward control, private unchanged)")
+        logger.info(f"[Debounce] enabled (group media/forward/voice control, private unchanged)")
 
     async def terminate(self):
-        """清理所有未完成的 debounce 任务，防止资源泄漏"""
-        # 取消所有会话的 debounce 循环任务
         for sid, task in list(self.session_tasks.items()):
             if not task.done():
                 task.cancel()
-        # 等待所有任务真正取消（可选，确保资源释放）
         if self.session_tasks:
             await asyncio.gather(*self.session_tasks.values(), return_exceptions=True)
         self.session_tasks.clear()
         self.session_events.clear()
         logger.debug("[Debounce] All debounce tasks cancelled")
 
-    # ========== 新增：图片/表情/转发处理函数（仅群聊调用） ==========
-    def _process_media(self, chain, is_mentioned: bool):
-        """处理消息链中的图片、动画表情和合并转发消息（仅群聊）"""
+    def _process_media(self, chain, is_mentioned: bool, is_private: bool = False):
+        """处理消息链中的图片、动画表情、合并转发消息和语音"""
         for i, elem in enumerate(chain.message_list):
             if isinstance(elem, (Image, Sticker)):
                 if is_mentioned:
-                    continue  # 唤醒消息：始终保留
-                # 非唤醒消息
+                    continue
                 if self.image_recognition_only_on_mention:
                     chain.message_list[i] = Text("[图片]" if isinstance(elem, Image) else "[动画表情]")
                 else:
@@ -61,16 +61,50 @@ class DebouncePlugin(BasePlugin):
             elif isinstance(elem, Forward):
                 if is_mentioned:
                     if self.forward_recognition_only_on_mention:
-                        continue  # 唤醒消息且开关开启，保留原转发内容
+                        continue
                     else:
                         chain.message_list[i] = Text("[转发消息]")
                 else:
                     chain.message_list[i] = Text("[转发消息]")
+            elif isinstance(elem, Record):
+                # 语音消息处理
+                duration = getattr(elem, 'duration', 0)
+                # 长语音限制
+                if self.voice_max_duration > 0 and duration > self.voice_max_duration:
+                    chain.message_list[i] = Text(f"[长语音 {duration}秒]")
+                    continue
+
+                # 决定是否尝试识别语音
+                should_try_stt = False
+                if is_private:
+                    # 私聊：根据 voice_private_need_mention 判断是否需要提及
+                    if self.voice_private_need_mention:
+                        should_try_stt = is_mentioned
+                    else:
+                        should_try_stt = True
+                else:
+                    # 群聊：根据 voice_recognition_only_on_mention 判断
+                    if self.voice_recognition_only_on_mention:
+                        should_try_stt = is_mentioned
+                    else:
+                        should_try_stt = True
+
+                if should_try_stt:
+                    try:
+                        stt_client = self.ctx.provider_mgr.get_default_stt()
+                        if stt_client:
+                            # 保留原始语音元素，由框架后续识别
+                            pass
+                        else:
+                            chain.message_list[i] = Text("[语音]")
+                    except Exception:
+                        chain.message_list[i] = Text("[语音]")
+                else:
+                    chain.message_list[i] = Text("[语音]")
             elif isinstance(elem, Reply) and elem.chain:
-                self._process_media(elem.chain, is_mentioned)
+                self._process_media(elem.chain, is_mentioned, is_private)
 
     def _limit_media_count(self, chain, max_count: int):
-        """限制消息链中图片+表情的数量（仅群聊，且仅在非唤醒且关闭仅唤醒识图时调用）"""
         if self.image_recognition_only_on_mention:
             return
         media_indices = [i for i, e in enumerate(chain.message_list) if isinstance(e, (Image, Sticker))]
@@ -82,27 +116,33 @@ class DebouncePlugin(BasePlugin):
 
     @on.im_message(priority=Priority.HIGH)
     async def handle_msg(self, event: KiraMessageEvent):
-        # === Check waking words ===
+        # 检查唤醒词
         for m in event.message.chain:
             if isinstance(m, Text) and any(w in m.text for w in self.waking_words):
                 event.message.is_mentioned = True
                 break
 
-        # ========== 新增：仅对群聊进行媒体/转发处理 ==========
         if event.is_group_message():
             is_mentioned = event.is_mentioned
-            self._process_media(event.message.chain, is_mentioned)
+            self._process_media(event.message.chain, is_mentioned, is_private=False)
             if not is_mentioned and not self.image_recognition_only_on_mention:
                 self._limit_media_count(event.message.chain, self.max_images_per_message)
+        else:
+            # 私聊
+            is_mentioned = event.is_mentioned
+            self._process_media(event.message.chain, is_mentioned, is_private=True)
+            # 私聊中不需要限制图片数量（因为一对一）
 
-        # Ignore unmentioned messages (官方原版逻辑，使用 discard)
         if not event.is_mentioned:
             if self.receive_unmentioned:
                 buffer = self.ctx.get_buffer(str(event.session))
                 if buffer.get_length() >= self.max_unmentioned_messages:
                     buffer.pop(count=buffer.get_length()-self.max_unmentioned_messages+1)
                 event.buffer()
-                if self.group_proactive_chat:
+                if self.group_proactive_chat and not event.is_group_message():
+                    # 主动回复仅支持群聊
+                    pass
+                elif self.group_proactive_chat and event.is_group_message():
                     if random.random() < self.group_proactive_chat_probability:
                         logger.info("[Chat] Triggered proactive chat")
                         event.flush()
@@ -144,10 +184,8 @@ class DebouncePlugin(BasePlugin):
                 except Exception:
                     logger.exception(f"[Debounce] Error flushing session {sid}")
         except asyncio.CancelledError:
-            # 任务被取消时正常退出，无需额外处理
             logger.debug(f"[Debounce] Debounce loop for session {sid} cancelled")
         finally:
-            # 清理会话相关的资源
             self.session_tasks.pop(sid, None)
             self.session_events.pop(sid, None)
 
