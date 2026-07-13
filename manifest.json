@@ -3,6 +3,6 @@
     "plugin_id": "default-chat（z）",
     "version": "1.3.1",
     "author": "KiraAI+znq19",
-    "description": "Default IM Chat processing implementation, merge messages received in a certain duration & add unmentioned messages as context",
+    "description": "默认聊天插件优化，修改原版开启上下文收听后默认所有语音、图片、合并转发消息都识别的逻辑，减轻小水管模型的负担。",
     "repo": "https://github.com/znq19/KiraAI_Default-Chat-Z-"
 }
