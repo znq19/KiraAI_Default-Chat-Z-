@@ -1,39 +1,41 @@
 {
   "waking_words": {
-    "name": "Waking words",
+    "name": "唤醒词",
     "type": "list",
     "default": [],
-    "hint": "Mark as mentioned if any of the words appeared in the message"
+    "hint": "消息中包含这些词时视为被提及（即使未被@）"
   },
   "receive_unmentioned": {
-    "name": "Receive Unmentioned Messages",
+    "name": "接收非唤醒消息",
     "type": "switch",
     "default": false,
-    "hint": "Receive unmentioned messages as context"
+    "hint": "是否将非唤醒消息也加入上下文（用于持续对话）"
   },
   "max_unmentioned_messages": {
-    "name": "Max Unmentioned Messages",
+    "name": "最大非唤醒消息数",
     "type": "integer",
     "default": 5,
-    "hint": "Max unmentioned message count to be added to buffer as context"
+    "hint": "缓冲区中最多保留多少条非唤醒消息作为上下文"
   },
   "group_chat_prompt": {
-    "name": "Group Chat Prompt",
+    "name": "群聊额外提示词",
     "type": "markdown",
-    "default": "",
-    "hint": "Extra prompt for AI to better behave in group chat"
+    "default": "### 群聊环境说明\r\n\r\n当前为群聊环境，你需要聚焦于**和你有直接关联**或**你十分感兴趣**的消息，对于仅显示为[动画表情]或[图片]的消息不用互动，注意不要刷屏，可以选择不回复任何消息，直接输出<msg/>即可。\r\n\r\n## 消息感知\r\n\r\n你可能会同时收到多条消息，请根据上下文自主决策该回复哪些消息，注意不要刷屏，也可以选择不回复任何消息，直接输出<msg/>即可。\r\n你可以使用 <reasoning>reasoning_content</reasoning> 的标签格式来输出推理内容放在整个输出的最前面，用于推理应该回复哪些消息，回复语气，回复条数，消息分段情况等。\r\n<reasoning>标签和<msg>标签同级，**禁止**将次标签放到<msg>标签内。\r\n**符合以上规则的情况下**确保你想发的聊天消息在<text>标签内，不要遗漏。\r\n",
+    "hint": "注入到 system prompt 中，用于指导 AI 在群聊中的行为"
   },
   "group_proactive_chat": {
-    "name": "Group Proactive Chat",
+    "name": "群聊主动发言",
     "type": "switch",
     "default": false,
-    "hint": "Allow AI to send messages proactively in group chats, be sure to have receive_unmentioned enabled"
+    "hint": "允许 AI 在群聊中主动发送消息（需同时启用接收非唤醒消息）"
   },
   "group_proactive_chat_probability": {
-    "name": "Group Proactive Chat Probability",
+    "name": "群聊主动发言概率",
     "type": "float",
     "default": 0.1,
-    "hint": "Probability of triggering a proactive message (default 0.1)"
+    "minimum": 0,
+    "maximum": 1,
+    "hint": "每条非唤醒消息触发主动发言的概率"
   },
   "image_recognition_only_on_mention": {
     "name": "仅唤醒消息识图",
@@ -43,7 +45,7 @@
   },
   "image_recognition_probability": {
     "name": "识图概率",
-    "type": "number",
+    "type": "float",
     "default": 0.5,
     "minimum": 0,
     "maximum": 1,
@@ -79,6 +81,6 @@
     "type": "integer",
     "default": 0,
     "minimum": 0,
-    "hint": "仅当语音时长不超过此值时才会尝试识别（0表示不限制）。超过此秒数的语音会直接替换为[长语音 X秒]。"
+    "hint": "仅当语音时长不超过此值时才会尝试识别（0表示不限制）。超过此秒数的语音会直接替换为[长语音 X秒]。对缺少时长元数据的语音（如被引用的机器人自己的语音）会尽力估算时长后再判断。"
   }
 }
