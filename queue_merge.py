@@ -52,6 +52,36 @@ class BatchMergeScheduler:
         self.media_preprocess_enabled = sec.get("media_preprocess_enabled", True)
         self.media_preprocess_max_batches = int(sec.get("media_preprocess_max_batches", 0))
         self.debug_log_enabled = sec.get("debug_log_enabled", False)
+        # in-flight 卡死兜底：从"最后一次 LLM 响应活动"起超过该时长仍无动静，才强制推送
+        # 积压批次（防"批次被拦截但收尾事件永远不来"导致的会话队列死锁）。
+        # 说明：批次一旦放行就走原版同一管线，LLM 挂起由框架 httpx 超时兜底（错误响应仍会
+        # 触发收尾事件、自动释放 pending），本兜底只覆盖"根本没有收尾事件"的异常路径
+        # （非 provider 异常任务崩溃 / 被其它插件 stop / 任务被取消）。
+        # 阈值 = LLM 超时 + 工具执行超时：两次 LLM 活动之间最多夹一轮工具执行（无心跳），
+        # 故余量取 tool_call_timeout 而非写死，用户改了配置也能自动对齐。
+        # 配置：-1=自动（默认 LLM timeout + tool_call_timeout，默认值）；0=不设置（关闭兜底，
+        #       完全信任事件配对，LLM 挂起由框架 httpx 超时兜底）；正整数=手动覆盖
+        stall_cfg = float(sec.get("inflight_stall_timeout", -1))
+        llm_timeout = 120.0
+        tool_timeout = 60.0
+        try:
+            pm = getattr(ctx, "provider_mgr", None)
+            if pm is not None and hasattr(pm, "get_default_llm"):
+                client = pm.get_default_llm()
+                if client is not None:
+                    mc = getattr(client.model, "model_config", None) or {}
+                    llm_timeout = float(mc.get("timeout", 120) or 120)
+            tc = ctx.config.get_config("bot_config.agent.tool_call_timeout")
+            if tc:
+                tool_timeout = float(tc)
+        except Exception:
+            pass
+        if stall_cfg == 0:
+            self.inflight_stall_timeout = 0.0  # 关闭兜底
+        elif stall_cfg > 0:
+            self.inflight_stall_timeout = stall_cfg
+        else:
+            self.inflight_stall_timeout = llm_timeout + tool_timeout  # -1 自动
 
         # -1 自动解析
         buffer_cap = int(bot_cfg.get("max_buffer_messages", 5))
@@ -66,6 +96,7 @@ class BatchMergeScheduler:
 
         # per-sid 状态
         self._inflight: dict[str, str] = {}          # sid -> event_id（当前正在处理的批次）
+        self._inflight_since: dict[str, float] = {}  # sid -> 最近一次 LLM 活动时间（卡死兜底用）
         self._final_marked: set[str] = set()         # 该 sid 的 in-flight 批次已进入最后一步
         self._pending: dict[str, list[PendingBatch]] = {}   # sid -> 待推送队列
         self._lock = asyncio.Lock()
@@ -90,6 +121,13 @@ class BatchMergeScheduler:
                 # 自己推送的（合并/重放）批次：in-flight 就是它自己，直接放行，
                 # 防止"推送 -> 到达 -> 拦截自己 -> 超时再推 -> 再拦截"的死循环
                 return
+            if event.extra and event.extra.get("_qm_self"):
+                # 自发布批次兜底：即使 _inflight 被并发路径误清（见 _push_pending 注释），
+                # 带自发布标记的批次也绝对放行，并恢复 inflight 跟踪，防状态悬空
+                if self._inflight.get(sid) != event.event_id:
+                    self._inflight[sid] = event.event_id
+                    self._inflight_since[sid] = time.time()
+                return
             if sid in self._inflight or self._pending.get(sid):
                 # 积压媒体限制：pending 中已积压的含媒体批次达到上限时，
                 # 新到的含媒体批次直接放行独立处理（媒体及时识别，不无限积压/重复 VLM）
@@ -107,17 +145,21 @@ class BatchMergeScheduler:
             else:
                 # 空闲 -> 放行
                 self._inflight[sid] = event.event_id
+                self._inflight_since[sid] = time.time()
                 self._log(sid, f"放行批次 {event.event_id}")
 
     async def on_llm_response(self, event: KiraMessageBatchEvent, resp: LLMResponse, *_):
-        """ON_LLM_RESPONSE：无 tool_calls = 该批次最后一步（文本收尾）-> 标记。"""
+        """ON_LLM_RESPONSE：任何响应都刷新 in-flight 活动计时（LLM 慢但活着 = 不判卡死）；
+        无 tool_calls = 该批次最后一步（文本收尾）-> 标记。"""
         if not self.enabled:
             return
         async with self._lock:
             sid = event.session.sid
-            if self._inflight.get(sid) == event.event_id and not resp.tool_calls:
-                self._final_marked.add(sid)
-                self._log(sid, f"批次 {event.event_id} 进入最后一步（文本收尾）")
+            if self._inflight.get(sid) == event.event_id:
+                self._inflight_since[sid] = time.time()  # 活动心跳（含工具中间步）
+                if not resp.tool_calls:
+                    self._final_marked.add(sid)
+                    self._log(sid, f"批次 {event.event_id} 进入最后一步（文本收尾）")
 
     async def on_step_result(self, event: KiraMessageBatchEvent, *_):
         """ON_STEP_RESULT：最后一步消息已发送完（事实 #9）-> 执行推送决策（0 延迟）。"""
@@ -129,14 +171,23 @@ class BatchMergeScheduler:
             if self._inflight.get(sid) == event.event_id and sid in self._final_marked:
                 need_push = True
         if need_push:
-            await self._push_pending(sid)
+            await self._push_pending(sid, event.event_id)
 
     # ================= 推送决策（三分支，串行） =================
 
-    async def _push_pending(self, sid: str):
-        """锁内决策 + 状态更新，锁外 publish。并发调用时第二个 pop 空直接返回，安全。"""
+    async def _push_pending(self, sid: str, done_event_id: Optional[str] = None):
+        """锁内决策 + 状态更新，锁外 publish。
+
+        done_event_id：触发本次推送的完成批次 event_id（ON_STEP_RESULT 的事件）。
+        锁内先校验 _inflight[sid] 仍是该批次才执行——防止并发/重复事件（ON_STEP_RESULT
+        重复广播、hook 重复注册、tick 竞争等）在「发布合并批次 → 该批次到达
+        on_batch_message」的异步窗口内误清 _inflight，导致自己发布的批次被自己
+        拦截进 pending（会话队列死锁根因）。校验失败直接 return，不动任何状态。
+        """
         to_publish = None
         async with self._lock:
+            if done_event_id is not None and self._inflight.get(sid) != done_event_id:
+                return
             to_publish = self._decide_and_apply_locked(sid)
         if to_publish is not None:
             n_msgs = len(to_publish.messages)
@@ -147,6 +198,7 @@ class BatchMergeScheduler:
         """三分支推送决策（须持有 _lock）：返回要发布的合并批次，状态已更新。"""
         pending = self._pending.pop(sid, [])
         self._inflight.pop(sid, None)
+        self._inflight_since.pop(sid, None)
         self._final_marked.discard(sid)
         if not pending:
             return None
@@ -176,6 +228,7 @@ class BatchMergeScheduler:
         self._pending[sid] = rest
         merged = self._build_merged_batch(to_merge)
         self._inflight[sid] = merged.event_id
+        self._inflight_since[sid] = time.time()
         return merged
 
     # ================= 阈值防护 =================
@@ -227,6 +280,12 @@ class BatchMergeScheduler:
 
     def _has_media(self, pb: PendingBatch) -> bool:
         for m in pb.batch.messages:
+            # 本插件 stage1 暂存（_pir_media）与并行识图插件（PIR）暂存（_pir_images）
+            # 都要检查：stage1 已把媒体替换为 Text 占位符，只看 chain 元素会漏判
+            if getattr(m, "_pir_media", None):
+                return True
+            if getattr(m, "_pir_images", None):
+                return True
             for elem in getattr(m, "chain", []) or []:
                 if isinstance(elem, (Image, Sticker, Record)):
                     return True
@@ -250,7 +309,9 @@ class BatchMergeScheduler:
             adapter=last.adapter,
             session=last.session,
             messages=msgs,
-            extra={"merged_from": [b.batch.event_id for b in batches]},
+            # _qm_self：自发布标记，on_batch_message 凭此兜底放行自己发布的批次
+            #（详见 on_batch_message / _push_pending 注释），防异步窗口竞态自拦截
+            extra={"merged_from": [b.batch.event_id for b in batches], "_qm_self": True},
         )
         return merged
 
@@ -280,15 +341,23 @@ class BatchMergeScheduler:
                     continue
                 inflight = self._inflight.get(sid)
                 if inflight and sid not in self._final_marked:
-                    # in-flight 仍在处理（未到最后一步）——正常等待，仅当攒批超时（卡死兜底）才强制推送
-                    if self.max_merge_seconds > 0 and now - pending[0].arrival_ts < self.max_merge_seconds:
-                        continue
-                    if self.max_merge_seconds > 0:
-                        self._log(sid, f"超时兜底：in-flight 疑似卡死，强制推送 pending")
+                    # in-flight 仍在处理（未到最后一步）
+                    # 卡死判定：自最后一次 LLM 活动（on_llm_response 心跳，含工具中间步）
+                    # 起超过 inflight_stall_timeout 仍无动静 —— LLM 挂起/任务崩溃/被其他插件
+                    # stop 都会让收尾事件永远不来，此时强制清场推送 pending 防队列死锁。
+                    # 配置 0（不设置）时 timeout=0，恒不判定。
+                    stalled = (
+                        self.inflight_stall_timeout > 0
+                        and now - self._inflight_since.get(sid, now) >= self.inflight_stall_timeout
+                    )
+                    if not stalled:
+                        # 攒批超时（max_merge_seconds>0 且到点）时，即使 in-flight 未收尾也强制推送
+                        if self.max_merge_seconds > 0 and now - pending[0].arrival_ts >= self.max_merge_seconds:
+                            self._log(sid, f"超时兜底：in-flight 未收尾且攒批到点，强制推送 pending")
+                        else:
+                            continue
                     else:
-                        # max_merge_seconds=0：不攒批，但仍由事件配对（当前批次完成）驱动，
-                        # 避免 tick 在 in-flight 未完成时并发强制推送（0 语义 = 当前批次一完成立即合并推送）
-                        continue
+                        self._log(sid, f"in-flight 卡死兜底（>{self.inflight_stall_timeout:.0f}s 无收尾），强制推送 pending")
                 merged = self._decide_and_apply_locked(sid)
                 if merged is not None:
                     to_publish.append(merged)
@@ -300,18 +369,25 @@ class BatchMergeScheduler:
     # ================= 生命周期 =================
 
     async def shutdown(self):
-        """terminate 时调用：尽力重发 pending（不合并，逐个 1:1），取消 tick。可重入。"""
+        """terminate 时调用：pending 以【全新 batch】按 sid 合并重发（新 event_id、干净 stop 状态），
+        取消 tick。可重入。
+
+        ⚠️ 必须用全新 batch 对象：KiraMessageBatchEvent._is_stopped 一旦 stop() 置 True 无法复位，
+        event_id 也只在构造时生成。原对象（is_stopped=True）重进 ON_IM_BATCH_MESSAGE 管线后，
+        钩子循环执行第一个钩子就会判停并 return，消息永远不会再被处理（热重载丢消息根因）。
+        """
         task = None
-        to_publish = []
+        to_publish: list[PendingBatch] = []
         async with self._lock:
             task = self._merge_task
             self._merge_task = None
             for sid, pend in self._pending.items():
+                to_publish.extend(pend)
                 for pb in pend:
-                    to_publish.append(pb.batch)
                     self._log(sid, f"shutdown 重发 pending 批次 {pb.batch.event_id}")
             self._pending.clear()
             self._inflight.clear()
+            self._inflight_since.clear()
             self._final_marked.clear()
         if task and not task.done():
             task.cancel()
@@ -319,8 +395,14 @@ class BatchMergeScheduler:
                 await task
             except asyncio.CancelledError:
                 pass
-        for batch in to_publish:
+        # 按 sid 分组，每 sid 合并为一个全新批次发布
+        by_sid: dict[str, list[PendingBatch]] = {}
+        for pb in to_publish:
+            by_sid.setdefault(pb.batch.session.sid, []).append(pb)
+        for sid, pend in by_sid.items():
             try:
-                await self.ctx.event_bus.publish(batch)
+                fresh = self._build_merged_batch(pend)
+                self._log(sid, f"shutdown 重发合并批次 {fresh.event_id}（{len(pend)} 批次 / {len(fresh.messages)} 条）")
+                await self.ctx.event_bus.publish(fresh)
             except Exception:
                 logger.exception("[QueueMerge] shutdown republish failed")
