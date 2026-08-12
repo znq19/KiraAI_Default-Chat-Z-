@@ -12,10 +12,6 @@
 - **并行媒体识别**：图片 VLM 与语音 STT 并行预处理，积压批次排队期间媒体即识别完成，推送时零等待——**回复更快**。并发限制分三级（批次级/会话级/全局级）可配，兼容并行识图插件（`section_media_recognition`）；同一消息内的每个媒体最多识别一次，模型限流（429）时不会反复重试。
 - **热重载不丢消息**：插件终止/重载时积压批次会以全新批次安全重发，不再出现消息积压后永久无法处理的问题。
 
-## v1.5.4 更新
-
-- **修复 event.extra 为 None 崩溃**：`BatchMergeScheduler.on_batch_message` 中 `event.extra.get("_qm_self")` 未判空，外部批次事件 `extra` 为 `None` 时会抛 `AttributeError: 'NoneType' object has no attribute 'get'` 导致插件报错，已加 None 防护（与 S 版行为对齐）。
-
 安装方法：根据个人喜好可采取两种方式——
 
 方式一：复制文件夹内容替换KiraAI-main\core\plugin\builtin_plugins\chat文件夹下内容，即直接替代原版Default Chat插件。
