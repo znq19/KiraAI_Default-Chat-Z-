@@ -1,7 +1,7 @@
 {
   "display_name": "Default Chat（z）默认聊天优化",
   "plugin_id": "default-chat（z）",
-  "version": "1.6.2",
+  "version": "1.6.4",
   "author": "KiraAI+znq19",
   "description": "默认聊天插件优化，合并积压队列和媒体预处理，修改原版开启上下文收听后默认所有语音、图片、合并转发消息都识别的逻辑，减轻小水管模型的负担。v1.6.0 新增：存在感节流、骚扰感知化（戳/at/关键词/引用检测+XML决策屏蔽）、休眠时段（起夜概率+维持期+主动续窗）。",
   "repo": "https://github.com/znq19/KiraAI_Default-Chat-Z-",
