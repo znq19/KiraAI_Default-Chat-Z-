@@ -46,6 +46,7 @@ class DebouncePlugin(BasePlugin):
         self.group_chat_prompt = self.plugin_cfg.get("group_chat_prompt", '### 群聊环境说明\r\n\r\n当前为群聊环境，你需要聚焦于**和你有直接关联**或**你十分感兴趣**的消息，对于仅显示为[动画表情]或[图片]的消息不用互动，注意不要刷屏，可以选择不回复任何消息，直接输出<msg/>即可。\r\n\r\n## 消息感知\r\n\r\n你可能会同时收到多条消息，请根据上下文自主决策该回复哪些消息，注意不要刷屏，也可以选择不回复任何消息，直接输出<msg/>即可。\r\n你可以使用 <reasoning>reasoning_content</reasoning> 的标签格式来输出推理内容放在整个输出的最前面，用于推理应该回复哪些消息，回复语气，回复条数，消息分段情况等。\r\n<reasoning>标签和<msg>标签同级，**禁止**将次标签放到<msg>标签内。\r\n**符合以上规则的情况下**确保你想发的聊天消息在<text>标签内，不要遗漏。\r\n')
         self.group_proactive_chat = self.plugin_cfg.get("group_proactive_chat", False)
         self.group_proactive_chat_probability = _safe_float(self.plugin_cfg.get("group_proactive_chat_probability"), 0.1)
+        self.proactive_k_prob_enabled = self.plugin_cfg.get("proactive_k_prob_enabled", True)
         self.proactive_scope_sessions = set(
             str(x) for x in (self.plugin_cfg.get("proactive_scope_sessions") or [])
         )
@@ -80,8 +81,8 @@ class DebouncePlugin(BasePlugin):
             "presence_k_max": self.plugin_cfg.get("presence_k_max", 2.0),
             "idle_bonus_score": self.plugin_cfg.get("idle_bonus_score", 15),
             "force_suppress": self.plugin_cfg.get("force_suppress", False),
-            "score_gate_deny": self.plugin_cfg.get("score_gate_deny", False),
-            "score_gate_boost": self.plugin_cfg.get("score_gate_boost", False),
+            "score_gate_deny": self.plugin_cfg.get("proactive_score_gate_deny", True),
+            "score_gate_boost": self.plugin_cfg.get("proactive_score_gate_boost", True),
             "score_threshold": self.plugin_cfg.get("score_threshold", 60),
             "dormant_ranges": self.plugin_cfg.get("dormant_ranges", []),
             "dormant_wake_probability": self.plugin_cfg.get("dormant_wake_probability", 0.3),
@@ -95,6 +96,18 @@ class DebouncePlugin(BasePlugin):
             "dormant_scope_sessions": self.plugin_cfg.get("dormant_scope_sessions", []),
             "dormant_whitelist_users": self.plugin_cfg.get("dormant_whitelist_users", []),
             "dormant_whitelist_sessions": self.plugin_cfg.get("dormant_whitelist_sessions", []),
+            # 私聊独立参数
+            "dm_presence_enabled": self.plugin_cfg.get("dm_presence_enabled", True),
+            "dm_presence_window_size": self.plugin_cfg.get("dm_presence_window_size", 10),
+            "dm_presence_target_ratio": self.plugin_cfg.get("dm_presence_target_ratio", 0.7),
+            "dm_presence_k_min": self.plugin_cfg.get("dm_presence_k_min", 0.5),
+            "dm_presence_k_max": self.plugin_cfg.get("dm_presence_k_max", 2.0),
+            "dm_score_threshold": self.plugin_cfg.get("dm_score_threshold", 30),
+            "dm_score_increment": self.plugin_cfg.get("dm_score_increment", 2),
+            "dm_score_penalty": self.plugin_cfg.get("dm_score_penalty", 3),
+            "dm_score_cap": self.plugin_cfg.get("dm_score_cap", 50),
+            "dm_idle_bonus_score": self.plugin_cfg.get("dm_idle_bonus_score", 15),
+            "dm_idle_bonus_ratio": self.plugin_cfg.get("dm_idle_bonus_ratio", 1.5),
         }
         for _kind in ("poke", "at", "keyword", "reply"):
             _enhance_cfg[f"section_{_kind}"] = {
@@ -446,6 +459,15 @@ class DebouncePlugin(BasePlugin):
         # === 聊天增强引擎：存在感记录 + 骚扰检测 + 休眠判定 ===
         # 必须在未提及分支之前调用：未提及消息也要统计存在感/骚扰/休眠
         self.enhance.on_im_message(event)
+
+        # 评分补正对提及消息的影响（存在感节流下独立控制）
+        if event.is_mentioned and not self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), sid):
+            is_dm = not event.is_group_message()
+            scope = "mentioned_dm" if is_dm else "mentioned"
+            mentioned_gate = self.enhance.score_gate(sid, True, scope=scope, is_dm=is_dm)
+            if not mentioned_gate:
+                event.is_mentioned = False
+
         # 休眠期内起夜未命中：抑制触发（不推送 LLM）
         if getattr(event, "_enhance_dormant_blocked", False):
             event.discard()
@@ -469,7 +491,9 @@ class DebouncePlugin(BasePlugin):
                         and not self.enhance.dormant.in_dormant(self.enhance._now_hhmm(), _psid) \
                         and self._is_proactive_allowed(_psid):
                     # 存在感节流：概率 × k_prob（回少提高/回多降低）
-                    prob = self.group_proactive_chat_probability * self.enhance.k_prob(_psid)
+                    prob = self.group_proactive_chat_probability
+                    if self.proactive_k_prob_enabled:
+                        prob *= self.enhance.k_prob(_psid)
                     prob_hit = random.random() < prob
                     # 评分补正：评分不足概率命中作废；评分够概率未命中补触发
                     if self.enhance.score_gate(_psid, prob_hit):

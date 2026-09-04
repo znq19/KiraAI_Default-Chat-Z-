@@ -568,16 +568,78 @@
     "default": 1.5,
     "hint": "相对判定：静默时长超过该会话历史平均静默 × 倍数才算闲时（冷场）。0=不判闲时"
   },
-  "score_gate_deny": {
-    "name": "门槛过滤（评分不足时阻止概率命中）",
+  "proactive_score_gate_deny": {
+    "name": "门槛过滤（群聊主动概率）",
     "type": "switch",
-    "default": false,
-    "hint": "概率命中后累计分不足阈值则阻止触发，分数保留继续攒"
+    "default": true,
+    "hint": "概率命中但累计分不足时阻止触发，分继续攒"
   },
-  "score_gate_boost": {
-    "name": "补偿触发（评分达标时强制补发）",
+  "proactive_score_gate_boost": {
+    "name": "补偿触发（群聊主动概率）",
     "type": "switch",
-    "default": false,
-    "hint": "概率未命中但累计分达阈值则强制补偿触发，触发后清零"
+    "default": true,
+    "hint": "概率未命中但累计分达标时强制触发并清零"
+  },
+  "proactive_k_prob_enabled": {
+    "name": "概率调节",
+    "type": "switch",
+    "default": true,
+    "hint": "是否受 k_prob 调节系数影响（回少提高/回多降低）"
+  },
+  "dm_presence_enabled": {
+    "name": "私聊独立存在感节流",
+    "type": "switch",
+    "default": true,
+    "hint": "私聊使用独立参数。关则与群聊共享"
+  },
+  "dm_presence_target_ratio": {
+    "name": "私聊发言占比基准",
+    "type": "float",
+    "default": 0.7
+  },
+  "dm_presence_window_size": {
+    "name": "私聊窗口条数",
+    "type": "integer",
+    "default": 10
+  },
+  "dm_presence_k_min": {
+    "name": "私聊概率下限",
+    "type": "float",
+    "default": 0.5
+  },
+  "dm_presence_k_max": {
+    "name": "私聊概率上限",
+    "type": "float",
+    "default": 2.0
+  },
+  "dm_score_threshold": {
+    "name": "私聊评分阈值",
+    "type": "float",
+    "default": 30
+  },
+  "dm_score_increment": {
+    "name": "私聊加分",
+    "type": "float",
+    "default": 2
+  },
+  "dm_score_penalty": {
+    "name": "私聊扣分",
+    "type": "float",
+    "default": 3
+  },
+  "dm_score_cap": {
+    "name": "私聊评分上限",
+    "type": "float",
+    "default": 50
+  },
+  "dm_idle_bonus_score": {
+    "name": "私聊闲时加分",
+    "type": "float",
+    "default": 15
+  },
+  "dm_idle_bonus_ratio": {
+    "name": "私聊闲时判定倍数",
+    "type": "float",
+    "default": 1.5
   }
 }
