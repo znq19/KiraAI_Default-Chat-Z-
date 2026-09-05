@@ -230,6 +230,23 @@ class DebouncePlugin(BasePlugin):
             "dm_score_cap": _dmp("dm_score_cap", 50),
             "dm_idle_bonus_score": _dmp("dm_idle_bonus_score", 15),
             "dm_idle_bonus_ratio": _dmp("dm_idle_bonus_ratio", 1.5),
+            # 额外信号（user_msgs/session_msgs 群聊+私聊开关与参数；bot_speech 仅群聊）
+            "detect_user_msgs": _sec("section_detect", "detect_user_msgs", False),
+            "detect_session_msgs": _sec("section_detect", "detect_session_msgs", False),
+            "detect_bot_speech": _sec("section_detect", "detect_bot_speech", False),
+            "dm_detect_user_msgs": _sec("section_detect", "dm_detect_user_msgs", False),
+            "dm_detect_session_msgs": _sec("section_detect", "dm_detect_session_msgs", False),
+            "user_msgs_window_seconds": _sec("section_thresholds", "user_msgs_window_seconds", 60),
+            "user_msgs_threshold": _sec("section_thresholds", "user_msgs_threshold", 10),
+            "session_msgs_window_seconds": _sec("section_thresholds", "session_msgs_window_seconds", 60),
+            "session_msgs_threshold": _sec("section_thresholds", "session_msgs_threshold", 20),
+            "bot_speech_window_seconds": _sec("section_thresholds", "bot_speech_window_seconds", 300),
+            "bot_speech_threshold": _sec("section_thresholds", "bot_speech_threshold", 10),
+            "dm_user_msgs_window_seconds": _sec("section_thresholds", "dm_user_msgs_window_seconds", 60),
+            "dm_user_msgs_threshold": _sec("section_thresholds", "dm_user_msgs_threshold", 10),
+            "dm_session_msgs_window_seconds": _sec("section_thresholds", "dm_session_msgs_window_seconds", 60),
+            "dm_session_msgs_threshold": _sec("section_thresholds", "dm_session_msgs_threshold", 20),
+            "extra_default_duration": _sec("section_thresholds", "extra_default_duration", 180),
         }
         for _kind in ("poke", "at", "keyword", "reply"):
             _pk = _sec(f"section_{_kind}", "enabled", False)

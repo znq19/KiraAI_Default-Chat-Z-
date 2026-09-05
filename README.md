@@ -1,4 +1,4 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.7.4
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.7.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
