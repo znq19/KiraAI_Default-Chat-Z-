@@ -1,8 +1,8 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.6.4
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.6.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
-修改原版默认所有语音、图片、合并转发都识别的逻辑，减轻小水管模型负担。v1.6.4，KiraAI 2.29.6+ 可用（原生多模态兼容需 2.31.0+）。
+修改原版默认所有语音、图片、合并转发都识别的逻辑，减轻小水管模型负担。v1.6.5，KiraAI 2.29.6+ 可用（原生多模态兼容需 2.31.0+）。
 
 默认仅唤醒消息（at/关键词/引用回复）中的语音、图片、转发才会识别。关闭对应开关后，非唤醒消息的图片按概率和数量选取，语音/转发全部阅读。
 
@@ -31,7 +31,7 @@
 <details>
 <summary>更新日志</summary>
 
-### v1.6.4
+### v1.6.5
 
 - **私聊独立存在感节流**：私聊有独立评分/k_prob 参数（窗口 10、占比 0.7、阈值 30、加分 2 扣分 3），默认开
 - **评分补正细化**：`proactive_score_gate_deny/boost`（默认开）+ `mentioned_*`（群聊/私聊，默认关）
