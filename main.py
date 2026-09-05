@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import json
 import os
 import random
 import sys
@@ -102,8 +103,13 @@ class DebouncePlugin(BasePlugin):
                 from core.utils.path_utils import get_config_path
                 _cfg_path = get_config_path() / "plugins" / "default-chat（z）.json"
                 if _cfg_path.parent.exists():
-                    with open(_cfg_path, "w", encoding="utf-8") as f:
-                        json.dump(cfg, f, indent=4, ensure_ascii=False)
+                    # 安全写入：先序列化生成字符串（不碰原文件），成功后再原子替换，
+                    # 任何异常都保证原配置文件不被清空（旧实现 open("w") 先截断再 dump，失败即清空）
+                    _content = json.dumps(cfg, indent=4, ensure_ascii=False)
+                    _tmp = _cfg_path.with_suffix(".json.tmp")
+                    with open(_tmp, "w", encoding="utf-8") as f:
+                        f.write(_content)
+                    _tmp.replace(_cfg_path)
                     logger.info(f"[Debounce] 迁移配置已写回: {_cfg_path}")
             except Exception as e:
                 logger.warning(f"[Debounce] 迁移写回配置文件失败（不影响本次运行）: {e}")
