@@ -1,8 +1,8 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.7.1
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.7.2
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
-修改原版默认所有语音、图片、合并转发都识别的逻辑，减轻小水管模型负担。v1.7.1，KiraAI 2.29.6+ 可用（原生多模态兼容需 2.31.0+）。
+修改原版默认所有语音、图片、合并转发都识别的逻辑，减轻小水管模型负担。v1.7.2，KiraAI 2.29.6+ 可用（原生多模态兼容需 2.31.0+）。
 
 默认仅唤醒消息（at/关键词/引用回复）中的语音、图片、转发才会识别。关闭对应开关后，非唤醒消息的图片按概率和数量选取，语音/转发全部阅读。
 
@@ -30,6 +30,10 @@
 
 <details>
 <summary>更新日志</summary>
+
+### v1.7.2
+
+- **修复配置迁移写回崩溃**：首次更新自动迁移时缺少 `import json`（NameError），且旧实现 `open("w")` 先截断再 dump 导致失败时配置文件被清空（下次启动报 Expecting value）——现改为先序列化再原子写回，失败也保证原配置文件完好
 
 ### v1.7.1
 
