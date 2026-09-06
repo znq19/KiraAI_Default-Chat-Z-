@@ -1,4 +1,4 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.7.5
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.7.6
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
@@ -30,6 +30,12 @@
 
 <details>
 <summary>更新日志</summary>
+
+### v1.7.6
+
+- **过滤空通知事件（QQ 戳一戳别人等系统通知）**：框架把所有 notice（poke 别人/运气王/头衔/荣誉/进退群/管理员等）以"message_id=None、零内容"的消息事件广播给插件，此前会进入评分（+3）、前文缓冲、主动概率判定（刷"评分补正"日志）与顺延重置（刷"顺延开始"日志）
+- 修复后：`is_notice` 且消息链完全为空 → 丢弃（群聊/私聊一致），不参与评分/前文/判定/顺延；有内容的全部保留（poke bot 的 `[Poke …]` 文本、`[System: …]` 系统提示、图片/语音/贴纸/文本消息）
+- 兼容 qq-enhance（Priority.HIGH+1 先增强 bot 相关通知 → chain 非空 → 保留）；只依赖框架核心字段 `event.is_notice` + `message.chain`
 
 ### v1.7.2
 
