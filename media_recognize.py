@@ -1,27 +1,23 @@
-"""并行媒体识别模块（v2.3.1）—— 图片 VLM + 音频 STT 并行预处理
+"""并行媒体识别模块（v2.3.2）—— 图片 VLM + 音频 STT 并行预处理
 
-设计要点（对齐方案文档 KiraAI并行媒体识别模块对齐方案.md v1.0）：
-- 三阶段标识符架构（照搬并行识图插件的成熟模式，扩展音频）：
-    stage1 (ON_IM_MESSAGE)     先把嵌套 Forward 就地拍平（借鉴并行识图插件 _flatten_forwards，
-                               防核心渲染过滤嵌套 Forward 丢内容），再把 Image/Sticker/Record
-                               替换为标识符 [Image #id: ] / [Record #id: ]，阻止框架 format_to_text
-                               串行识别；原始元素暂存到消息动态属性 _pir_media
-    stage2 (ON_IM_BATCH_MESSAGE) 收集批次内全部暂存媒体，同一 gather 混合并行识别
-                               （图片 VLM / 音频 STT 各自三层限流：批次级 batch_sem →
-                               会话级 _session_img_sems/_session_aud_sems → 全局级
-                               _global_img_sem/_global_aud_sem，固定顺序无死锁），
-                               填充 message_str 与 chain —— 积压批次在拦截前识别完成 = 真预处理
-    stage3 (ON_LLM_REQUEST)    历史/当前残留空标识符兜底（缓存命中→填；有原媒体→现场识别；否则 (已过期)）
-- 缓存：复用框架 image_desc_cache 表（图片 md5→描述；音频 to_base64 md5→transcript），零 DB 改动
-- VLM 描述词：跟随 WebUI 配置 bot_config.capabilities.image_recognition.desc_prompt
-  （对齐框架 message_format_to_text 行为；未配置时用 locale.lang 语言默认 prompt）
-- 兼容：compat_mode=auto 检测 parallel_image_reader 插件——装了则图片归它（优先级 99 先处理）、
-        本模块只做音频（它不碰 Record）；不装则全权接管图片+音频
-- 原生多模态：native 模式运行时实时检测（_native_mode()，非 __init__ 快照）——
-  用户在 WebUI 切换 bot_config.capabilities.image_recognition.mode 立即生效，
-  无需重启 Kira / 重载插件（配置走内存缓存，微秒级，零延迟）
-- 与 z/sustained"非唤醒不识别"兼容：im_message 钩子须定义在 handle_msg 之后（handle_msg 先替换
-  非唤醒媒体为 [图片]/[语音] 占位，本模块后执行链上已无媒体 → 不识别非唤醒消息）
+设计要点（对齐方案文档 KiraAI并行媒体识别模块对齐方案.md v1.1）：
+- 三阶段架构（stage1 ON_IM_MESSAGE / stage2 ON_IM_BATCH_MESSAGE / stage3 ON_LLM_REQUEST）
+- v2.3.2 核心变更（Plus-One 复读兼容 + 官方格式对齐，用户拍板）：
+    * Image/Sticker **元素保留在 chain 中**（不再替换为标识符删除）——Plus-One 复读
+      表情包依赖 Sticker 元素；图片元素保留则纯图片消息天然不参与复读（Plus-One 只认
+      Text/Sticker）。转发消息的媒体同样保留。
+    * "识别/不识别"通过**预置 elem.caption** 表达：缓存命中 → desc（框架渲染官方
+      [Image desc, file_path: p] / [Sticker desc]（官方无路径，本模块增强追加路径））；
+      未命中且宿主标记不识别（仅唤醒/概率未中/超限）→ caption=""（官方空占位
+      [Image , file_path: p] / [Sticker ]，阻止框架自动 VLM，LLM 知道有媒体未识别）。
+    * 只有需要识别的媒体暂存 _pir_media，stage2 并行 VLM 后回填 message_str（锚点
+      替换官方空占位）与 elem.caption。
+    * Record 语音照旧替换 [Record #id: ] 标识符（阻止框架自动 STT，走本模块限流+缓存）。
+- 原生多模态：native 模式运行时实时检测（_native_mode()）——图片由框架直传，本模块
+  不预置/不识别；语音 STT 归本模块照旧。
+- PIR 互斥（pir_auto_disable 默认开）：检测到 parallel_image_reader 启用 → 自动关闭
+  （本模块已覆盖其全部能力）；竞态/关闭失败降级让位，绝不双重处理。
+- 缓存：复用框架 image_desc_cache 表；VLM 描述词跟随 WebUI desc_prompt 配置。
 """
 from __future__ import annotations
 
@@ -63,7 +59,10 @@ class ParallelMediaRecognizer:
         self.stt_max_parallel_per_session = int(sec.get("stt_max_parallel_per_session", 15))
         self.stt_max_parallel_global = int(sec.get("stt_max_parallel_global", 40))
         self.media_timeout = float(sec.get("media_timeout", 60.0))
-        self.compat_mode = sec.get("compat_mode", "auto")
+        # 并行识图插件（PIR）自动互斥（默认开）：检测到 PIR 处于启用状态时自动关闭它，
+        # 图片识别完全由本模块接管（本模块能力已覆盖 PIR：并行 VLM + 缓存 + 限流 + 转发拍平 + 语音）。
+        # 运行时实时检测（与 _pir_active 同理），PIR 热插拔/手动开启后自动再次关闭。
+        self.pir_auto_disable = bool(sec.get("pir_auto_disable", True))
         self.quality_enabled = sec.get("quality_enabled", False)
         self.quality_value = int(sec.get("quality_value", 85))
 
@@ -108,21 +107,56 @@ class ParallelMediaRecognizer:
         logger.debug(f"[MediaRecognize] {msg}")
 
     def _pir_active(self) -> bool:
-        """运行时实时检测并行识图插件（PIR）是否已加载。
+        """运行时实时检测并行识图插件（PIR）是否已加载，且未被自动互斥关闭。
 
-        compat_mode=auto 时图片归 PIR（本模块只做音频）。不能像旧实现那样在
-        __init__ 里做一次性快照：插件可热重载/启停，快照会过时——PIR 中途卸载后
-        图片无人处理、中途加载后双重处理。
+        语义 v2.3.2 起简化（用户确认）：不再"装了就让位/只做音频"——本模块已覆盖并超越
+        PIR（并行 VLM、缓存、三层限流、转发拍平、语音 STT 全都有），PIR 的 stage1 会把
+        Image/Sticker 替换为 [Image #id: ] 标识符并删除原元素，破坏 Plus-One 复读表情包。
+        因此 pir_auto_disable=True（默认）时：检测到 PIR 启用 → 自动 set_plugin_enabled(False)
+        关闭它，图片完全归本模块；关闭失败/竞态（本轮事件 PIR 已先替换）时降级为旧语义
+        （图片归 PIR、本模块只做音频），绝不双重处理。
         """
-        if self.compat_mode != "auto":
-            return False
         try:
             pm = getattr(self.ctx, "plugin_mgr", None)
-            if pm is not None:
-                return pm.get_plugin_inst("parallel_image_reader") is not None
+            if pm is None:
+                return False
+            inst = pm.get_plugin_inst("parallel_image_reader")
+            if inst is None:
+                return False
+            # PIR 已加载：auto-disable 开启则尝试自动关闭（只关一次，防每事件重复 terminate）
+            if self.pir_auto_disable:
+                if not getattr(self, "_pir_disable_attempted", False):
+                    self._pir_disable_attempted = True
+                    asyncio.create_task(self._auto_disable_pir())
+                # 本轮事件：PIR 处于启用态，stage1 可能已先替换——降级让位，避免双重处理
+                return True
+            return True  # 互斥关闭：图片归 PIR，本模块只做音频（旧语义）
         except Exception:
-            pass
-        return False
+            return False
+
+    async def _auto_disable_pir(self):
+        """自动关闭并行识图插件（pir_auto_disable=True 时，任务启动后只执行一次）。"""
+        if not getattr(self, "pir_auto_disable", False):
+            return  # 防御：开关关闭时绝不操作（_pir_active 已保证，双保险）
+        try:
+            pm = getattr(self.ctx, "plugin_mgr", None)
+            if pm is None:
+                return
+            try:
+                enabled = await pm.is_plugin_enabled("parallel_image_reader")
+            except TypeError:
+                enabled = pm.is_plugin_enabled("parallel_image_reader")
+            if enabled:
+                try:
+                    await pm.set_plugin_enabled("parallel_image_reader", False)
+                except TypeError:
+                    pm.set_plugin_enabled("parallel_image_reader", False)
+                logger.info(
+                    "[MediaRecognize] 检测到并行识图插件已启用，已自动禁用（pir_auto_disable，"
+                    "图片识别由本模块全权接管；如需恢复 PIR 请在 WebUI 关闭本插件的自动互斥开关）"
+                )
+        except Exception as e:
+            logger.warning(f"[MediaRecognize] 自动禁用并行识图插件失败（不影响识别）: {type(e).__name__}: {e}")
 
     def _native_mode(self) -> bool:
         """运行时实时检测原生多模态模式（KiraAI v2.31.0+）。
@@ -206,13 +240,30 @@ class ParallelMediaRecognizer:
         stack.remove(cid)
 
     async def on_im_message(self, event: KiraMessageEvent, *_):
-        """ON_IM_MESSAGE：先拍平嵌套 Forward（防核心渲染丢内容），再遍历替换媒体为标识符并暂存。"""
+        """ON_IM_MESSAGE：先拍平嵌套 Forward（防核心渲染丢内容），再处理媒体。
+
+        核心设计 v2.3.2（复读兼容 + 官方格式对齐）：
+        - Image/Sticker 元素**保留在 chain 中**（不再替换为标识符/删除）——Plus-One
+          复读表情包依赖 chain 里存在 Sticker 元素；图片元素保留则纯图片消息天然
+          不参与复读（Plus-One 只认 Text/Sticker）。
+        - "识别/不识别"通过**预置 elem.caption** 表达：缓存命中 → desc（框架渲染
+          官方 [Image desc, file_path: p]）；未命中 → ""（阻止框架自动 VLM，渲染
+          官方空占位 [Image , file_path: p]，LLM 知道有媒体但未识别）。
+        - 宿主 handle_msg 已按"仅唤醒识别/识别概率"给不识别媒体打 _media_skip 标记
+          （caption=""），本阶段尊重标记：跳过的不暂存不 VLM；唤醒/概率命中的
+          未命中媒体才暂存 _pir_media 供 stage2 并行 VLM 后回填官方格式。
+        - Record 语音照旧替换为 [Record #id: ] 标识符（阻止框架自动 STT、走本模块
+          三层限流 + 缓存；语音不进复读判定，替换无副作用）。
+        """
         if not self.enabled:
             return
         try:
             self._flatten_forwards(event.message.chain)
             media: dict[str, dict] = {}
-            await self._walk_chain(event.message.chain, media, set())
+            await self._walk_chain(
+                event.message.chain, media, set(),
+                is_mentioned=bool(getattr(event, "is_mentioned", False)),
+            )
             if media:
                 # 合并而非覆盖：并行识图插件（PIR）可能已先写入 Image 索引，
                 # 直接覆盖会让它 stage2/stage3 拿不到图片（图片标识符永远空）
@@ -221,7 +272,7 @@ class ParallelMediaRecognizer:
         except Exception:
             logger.exception("[MediaRecognize] stage1 error")
 
-    async def _walk_chain(self, chain, media: dict, visited: set):
+    async def _walk_chain(self, chain, media: dict, visited: set, is_mentioned: bool = False):
         """递归遍历 chain（含 Reply.chain / Forward.chains，带环检测）。嵌套 Forward 已拍平。"""
         if chain is None:
             return
@@ -233,40 +284,70 @@ class ParallelMediaRecognizer:
             if isinstance(elem, Text):
                 continue
             if isinstance(elem, (Image, Sticker)):
-                # 并行识图插件已加载且 auto 模式：图片归它，本模块不碰。
+                # 并行识图插件接管中（自动互斥关闭未生效/竞态降级）：图片归它，本模块不碰。
                 # 运行时实时检测（不是 __init__ 快照），PIR 热重载/启停后自动生效
                 if self._pir_active():
                     continue
-                # 原生多模态模式（KiraAI v2.31.0+）：图片保留在 chain 中，
+                # 原生多模态模式（KiraAI v2.31.0+）：元素保留在 chain 中，
                 # 由框架 _build_native_content 收集并直传模型（官方压缩 + 持久化引用）。
-                # 本模块不替换、不识别图片，只做音频 STT。
+                # 本模块不预置 caption、不识别图片，只做音频 STT。
                 if self._native_mode():
                     continue
-                replaced = await self._replace_media(elem, "Image", media)
-                if replaced is not None:
-                    chain[idx] = replaced
+                mtype = "Image" if isinstance(elem, Image) else "Sticker"
+                await self._prefill_media(elem, mtype, media)
             elif isinstance(elem, Record):
                 replaced = await self._replace_media(elem, "Record", media)
                 if replaced is not None:
                     chain[idx] = replaced
             elif isinstance(elem, Reply):
-                await self._walk_chain(getattr(elem, "chain", None), media, visited)
+                await self._walk_chain(getattr(elem, "chain", None), media, visited, is_mentioned)
             elif isinstance(elem, Forward):
                 for sub in (getattr(elem, "chains", None) or []):
-                    await self._walk_chain(sub, media, visited)
+                    await self._walk_chain(sub, media, visited, is_mentioned)
+
+    async def _prefill_media(self, elem, mtype: str, media: dict):
+        """图片/表情包 → 预置 caption（元素保留，不替换、不删除）。
+
+        对齐官方渲染（core/message_manager.py：Image → [Image {caption}, file_path: {p}]；
+        Sticker → [Sticker {caption}]），并按"仅唤醒识别/概率"省 VLM：
+        - 缓存命中 → elem.caption = desc：框架渲染官方带描述格式，零 VLM、零暂存；
+        - 未命中且宿主标记 _media_skip（非唤醒仅唤醒开 / 概率未中 / 超限）→ caption=""
+          （官方空占位 [Image , file_path: p] / [Sticker ]，LLM 知道有媒体但未识别），不暂存不 VLM；
+        - 未命中且未标记（唤醒 / 概率命中）→ caption="" + 暂存 _pir_media，
+          stage2 并行 VLM 后回填 message_str（官方格式）与 elem.caption。
+        Sticker 与 Image 同规则：元素永远保留 → Plus-One 复读表情包不受识别影响。
+        """
+        # 宿主 handle_msg 已做"仅唤醒/概率"决策：_media_skip=True = 本次不识别（省 VLM）
+        if getattr(elem, "_media_skip", False):
+            elem.caption = ""  # 官方空占位 + 阻止框架自动 VLM（caption 非 None）
+            return
+        try:
+            md5 = await elem.hash_image()
+        except Exception:
+            md5 = None
+        short_id = md5[:8] if md5 else f"noid_{id(elem)}"
+        if md5:
+            desc = await self._cache_get(md5) or ""
+            if desc and not self._is_valid_desc(desc):
+                desc = ""
+            if desc:
+                # 缓存命中：直接预置官方描述（零 VLM）。不进 media（_done 隐含），
+                # 同一批消息重发时无需再处理——stage2 只认 _pir_media 里的媒体。
+                elem.caption = desc
+                return
+        # 未命中：暂存原元素供 stage2 并行识别（唤醒/概率命中路径）
+        elem.caption = ""  # 先阻止框架自动 VLM，stage2 识别完成后回填官方格式
+        media[short_id] = {"md5": md5, "elem": elem, "type": mtype, "_done": False}
 
     async def _replace_media(self, elem, mtype: str, media: dict) -> Optional[Text]:
-        """媒体 → 标识符 Text；缓存命中填内容、miss 空标识符 + 暂存原元素。
+        """语音 Record → 标识符 Text（仅供 Record 使用；图片/表情包走 _prefill_media）。
 
-        _done 标记语义：标识符已含最终内容（缓存描述）或已识别过（含失败），
-        stage2 重发（队列合并重放）时跳过——每条消息的每个媒体最多识别一次，
-        避免同一条消息被反复 VLM/STT（限流/429 风暴源头）。
+        语音替换为 [Record #id: ] 标识符：阻止框架自动 STT（串行、无限流），改由
+        stage2 并行 STT（三层限流 + image_desc_cache 缓存复用），语义与旧版一致。
+        _done 标记：缓存命中（已含内容）或已识别过 → 重发跳过，防重复 STT/429。
         """
         try:
-            if mtype == "Record":
-                md5 = await self._record_md5(elem)
-            else:
-                md5 = await elem.hash_image()
+            md5 = await self._record_md5(elem)
         except Exception:
             md5 = None
         if md5:
@@ -279,12 +360,11 @@ class ParallelMediaRecognizer:
             desc = ""
         media[short_id] = {"md5": md5, "elem": elem, "type": mtype, "_done": bool(desc)}
         if desc:
-            # 缓存命中：直接带 file_path（to_path 幂等，_temp_path 已缓存不重复下载），
-            # 对齐原版 message_format_to_text 的 [Image desc, file_path: xxx] 格式
+            # 缓存命中：直接带 file_path（to_path 幂等，_temp_path 已缓存不重复下载）
             p = await self._media_path(elem)
             if p:
-                return Text(f"[{mtype} #{short_id}: {desc}, file_path: {p}]")
-        return Text(f"[{mtype} #{short_id}: {desc}]")
+                return Text(f"[Record #{short_id}: {desc}, file_path: {p}]")
+        return Text(f"[Record #{short_id}: {desc}]")
 
     async def _media_path(self, elem) -> Optional[str]:
         """对齐原版 message_format_to_text：to_path 落盘后转 data/ 相对路径。
@@ -350,10 +430,10 @@ class ParallelMediaRecognizer:
                 for message, media in tasks
             ]
             pending_tasks = [(m, md) for m, md in pending_tasks if md]
-            # 原生多模态模式：图片已由框架直传模型，stage2 只做音频 STT
+            # 原生多模态模式：图片/表情包已由框架直传模型，stage2 只做音频 STT
             if self._native_mode():
                 pending_tasks = [
-                    (m, {k: v for k, v in md.items() if v.get("type") != "Image"})
+                    (m, {k: v for k, v in md.items() if v.get("type") not in ("Image", "Sticker")})
                     for m, md in pending_tasks
                 ]
                 pending_tasks = [(m, md) for m, md in pending_tasks if md]
@@ -366,7 +446,7 @@ class ParallelMediaRecognizer:
             coros = []
             for _, media in pending_tasks:
                 for short_id, info in media.items():
-                    if info["type"] == "Image":
+                    if info["type"] in ("Image", "Sticker"):
                         coros.append(self._describe_one(sess_sid, short_id, info, results, batch_sem=batch_img_sem))
                     else:
                         coros.append(self._transcribe_one(sess_sid, short_id, info, results, batch_sem=batch_aud_sem))
@@ -387,10 +467,60 @@ class ParallelMediaRecognizer:
                 hit = any(sid in results for sid in media)
                 if hit:
                     if message.message_str:
-                        message.message_str = self._fill_text(message.message_str, results, paths)
+                        message.message_str = self._fill_message_str(
+                            message.message_str, results, paths, message.chain)
                     self._fill_chain(message.chain, results, paths)
         except Exception:
             logger.exception("[MediaRecognize] stage2 error")
+
+    def _fill_message_str(self, text: str, results: dict, paths: dict,
+                          chain=None) -> str:
+        """填充 message_str：以 chain 里 Image/Sticker 元素（官方空占位锚点）优先，
+        找不到时按 [Media #id: ] 标识符兜底（语音 Record / 历史遗留标识符）。
+
+        chain 优先：官方格式占位的 file_path 与 chain 元素逐位对应，按序替换
+        （同一消息多个 [Image , file_path: data/x] 各自独立、互不误伤）。
+        chain 不可得/无匹配时退回 _fill_text（Record 标识符与旧格式兼容）。
+        """
+        if chain is not None:
+            # 递归遍历 chain 中所有 Image/Sticker（含 Reply.chain / Forward.chains），
+            # 按官方空占位顺序逐一回填——嵌套引用/转发里的媒体同样生效
+            replaced = False
+            for elem in self._iter_media_elems(chain):
+                filled = self._fill_official(elem, results, paths)
+                if not filled or not filled[0]:
+                    continue
+                short_id, desc, p = filled
+                mtype = "Image" if isinstance(elem, Image) else "Sticker"
+                new_text = self._fill_official_text(text, mtype, desc, p)
+                if new_text != text:
+                    text = new_text
+                    replaced = True
+            if replaced:
+                return text
+        # chain 无 Image/Sticker 命中：退回标识符填充（Record / 嵌套链 / 兼容）
+        return self._fill_text(text, results, paths)
+
+    @staticmethod
+    def _iter_media_elems(chain):
+        """递归 yield chain 内所有 Image/Sticker（含 Reply.chain / Forward.chains，防环）。"""
+        seen = set()
+        def _walk(c):
+            if c is None:
+                return
+            cid = id(c)
+            if cid in seen:
+                return
+            seen.add(cid)
+            for ele in c:
+                if isinstance(ele, (Image, Sticker)):
+                    yield ele
+                elif isinstance(ele, Reply):
+                    yield from _walk(getattr(ele, "chain", None))
+                elif isinstance(ele, Forward):
+                    for sub in (getattr(ele, "chains", None) or []):
+                        yield from _walk(sub)
+        yield from _walk(chain)
 
     async def _describe_one(self, sess_sid: str, media_id: str, info: dict, results: dict,
                             batch_sem: Optional[asyncio.Semaphore] = None):
@@ -607,6 +737,7 @@ class ParallelMediaRecognizer:
     # ================= 填充 =================
 
     def _fill_text(self, text: str, results: dict, paths: Optional[dict] = None) -> str:
+        """按 [Media #id: ] 标识符填充（Record 语音标识符；兼容历史/占位模式遗留标识符）。"""
         for sid, desc in results.items():
             # 用 str.replace 而非 re.sub：replacement 是模板字符串，desc 含 \U/\x 等
             # 反斜杠序列（如 Windows 路径）会抛 bad escape；replace 无转义问题
@@ -617,7 +748,52 @@ class ParallelMediaRecognizer:
             text = text.replace(f"[Record #{sid}: ]", f"[Record #{sid}: {desc}{fp}]")
         return text
 
+    def _fill_official(self, elem, results: dict, paths: Optional[dict] = None):
+        """官方格式回填：把识别结果写回 Image/Sticker 元素（chain 保留原元素）。
+
+        对齐框架渲染（core/message_manager.py）：
+          Image  → [Image {caption}, file_path: {p}]
+          Sticker→ [Sticker {caption}]（官方无 file_path；本模块增强追加 , file_path: {p}，
+                   让 LLM 也能拿到表情包本地路径做图生图/上传——复读不受影响，元素始终保留）
+        返回 (short_id, desc, path) 供 _fill_official_text 在 message_str 里锚点替换；
+        找不到对应 media 时返回 None。
+        """
+        md5 = None
+        try:
+            md5 = getattr(elem, "md5", None) or None
+        except Exception:
+            md5 = None
+        if not md5:
+            return None
+        short_id = md5[:8]
+        desc = results.get(short_id)
+        if desc is None:
+            desc = results.get(f"noid_{id(elem)}")
+        if desc is None:
+            return None
+        p = ""
+        if paths and short_id in paths:
+            p = paths[short_id]
+        return (short_id, desc, p)
+
+    def _fill_official_text(self, text: str, mtype: str, desc: str, p: str) -> str:
+        """把 message_str 里的官方空占位替换为带描述的官方格式（只替换第一处）。
+
+        空占位形态（caption="" 时框架渲染）：
+          Image  → "[Image , file_path: {p}]"（to_path 成功）或 "[Image ]"（落盘失败降级）
+          Sticker→ "[Sticker ]"
+        识别后形态："[Image {desc}, file_path: {p}]" / "[Sticker {desc}, file_path: {p}]"
+        """
+        if mtype == "Image":
+            filled = f"[Image {desc}, file_path: {p}]" if p else f"[Image {desc}]"
+            if p:
+                text = text.replace(f"[Image , file_path: {p}]", filled, 1)
+            return text.replace("[Image ]", filled, 1)
+        filled = f"[Sticker {desc}, file_path: {p}]" if p else f"[Sticker {desc}]"
+        return text.replace("[Sticker ]", filled, 1)
+
     def _fill_chain(self, chain, results: dict, paths: Optional[dict] = None):
+        """回填 chain：Image/Sticker 元素写回 caption（元素保留）；Text 内 Record/历史标识符替换。"""
         if chain is None:
             return
         for elem in chain:
@@ -627,6 +803,11 @@ class ParallelMediaRecognizer:
                 new_text = self._fill_text(elem.text or "", results, paths)
                 if new_text != elem.text:
                     elem.text = new_text
+            elif isinstance(elem, (Image, Sticker)):
+                filled = self._fill_official(elem, results, paths)
+                if filled:
+                    short_id, desc, p = filled
+                    elem.caption = desc
             elif isinstance(elem, Reply):
                 self._fill_chain(getattr(elem, "chain", None), results, paths)
             elif isinstance(elem, Forward):

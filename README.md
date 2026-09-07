@@ -1,10 +1,20 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.7.7
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.7.8
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
-修改原版默认所有语音、图片、合并转发都识别的逻辑，减轻小水管模型负担。v1.7.2，KiraAI 2.29.6+ 可用（原生多模态兼容需 2.31.0+）。
+修改原版默认所有语音、图片、合并转发都识别的逻辑，减轻小水管模型负担。v1.7.8，KiraAI 2.29.6+ 可用（原生多模态兼容需 2.31.0+）。
 
 默认仅唤醒消息（at/关键词/引用回复）中的语音、图片、转发才会识别。关闭对应开关后，非唤醒消息的图片按概率和数量选取，语音/转发全部阅读。
+
+v1.7.8 媒体管线重构（与 **Plus-One 复读插件**兼容 + 官方格式对齐）：
+- **Image/Sticker 元素保留**：表情包可被 Plus-One 正确复读；图片元素保留则纯图片消息天然不参与复读。识别结果预置官方 `caption`，渲染官方 `[Image 描述, file_path: ...]` / `[Sticker 描述]`。
+- **仅唤醒识别完整保留**：非唤醒媒体预置空 caption（官方空占位），零 VLM、LLM 知道有媒体。
+- **PIR 自动互斥**（默认开）：自动关闭并行识图插件，识别完全由本插件接管。
+- **原生多模态不截断**：数量限制在 native 模式自动跳过（全直传，框架压缩控 token）。
+- **native 超限占位**：native 模式超限图片替换为 `[Image attached]` 占位拦直传（省 token，LLM 仍知道有图）；Sticker 永不占位（复读优先）。
+- **唤醒消息图片上限**（`max_images_per_message_mentioned`，默认 0 = 不限制）：唤醒消息超限图片同样占位省 token。
+- **native 仅唤醒识别生效**：仅唤醒开时非唤醒图片占位拦直传、唤醒图片保留直传（LLM 直接看图）。
+- **native 表情包跟随仅唤醒**（`native_sticker_follow_mention`，默认开，受上级仅唤醒开关门控）：非唤醒表情包占位 `[Sticker attached]` 省 token；注意开启后 Plus-One 复读表情包会不正确（复读占位文本），酌情关闭以保复读。
 
 ## 亮点
 
@@ -14,7 +24,7 @@
 - **骚扰感知化**：戳/连续 at/关键词/引用达到阈值 → System 通知 → bot 用 XML tag 决策屏蔽
 - **休眠时段**：可配休眠时间窗 + 起夜概率 + 维持期（续窗/一次性/次数上限）
 - **热重载不丢消息**：终止时积压批次安全重发，消息不丢失
-- **原生多模态兼容**：native 图片模式下保留图片链直传框架，本插件只做音频 STT
+- **原生多模态兼容**：native 图片模式下图片保留在链中由框架原生直传（官方压缩 + 持久化引用），本插件不预置 caption、不截断数量限制；转发/语音策略照旧（转发仅唤醒才保留、语音 STT 由本插件处理）
 
 想要更多能力？推荐安装 **sustained-chat**（[KiraAI_sustained_chat_plugin](https://github.com/znq19/KiraAI_sustained_chat_plugin)），支持群聊持续对话、私聊主动、定时任务等完整主动社交能力。
 
