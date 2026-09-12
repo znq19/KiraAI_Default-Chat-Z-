@@ -1110,6 +1110,19 @@ class DebouncePlugin(BasePlugin):
     # 注意：im_message 钩子必须定义在 handle_msg 之后（同优先级按注册顺序执行），
     #       保证"非唤醒不识别"配置先由 handle_msg 处理（兼容前提）
 
+    # ⚠ 官方 VLM 保护网 —— 必须是**最早**执行的 im_message 钩子（SYS_HIGH > HIGH）：
+    #   框架的官方 VLM 唯一触发条件是 `ele.caption is None`，而它的渲染发生在
+    #   **所有批次钩子之前**（message_manager.handle_im_batch_message 先渲染、后派发
+    #   ON_IM_BATCH_MESSAGE）→ 只要有一条消息的图片没被预置 caption（第三方插件抢先
+    #   stop / 钩子顺序异常 / stage1 异常），官方就会付费识图，**事后无法挽回**（拦截、
+    #   抢救都发生在渲染之后）。所以在这里抢在所有钩子之前，把 caption 从 None 占成 ""。
+    #   只占位：不暂存、不预取、不识别、不改任何消息策略；真正的识别仍由 handle_msg +
+    #   stage1 在 HIGH 按"仅唤醒识别/概率/超限"决定，省 VLM 语义不变。
+    #   与 handle_msg 不冲突：本钩子不看、也不动 is_mentioned / _media_skip。
+    @on.im_message(priority=Priority.SYS_HIGH)
+    async def guard_official_vlm(self, event: KiraMessageEvent, *_):
+        self.media_recognizer.guard_captions(event)
+
     @on.im_message(priority=Priority.HIGH)
     async def on_media_rec_im(self, event: KiraMessageEvent, *_):
         await self.media_recognizer.on_im_message(event)
