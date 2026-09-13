@@ -1121,7 +1121,7 @@ class DebouncePlugin(BasePlugin):
     #   与 handle_msg 不冲突：本钩子不看、也不动 is_mentioned / _media_skip。
     @on.im_message(priority=Priority.SYS_HIGH)
     async def guard_official_vlm(self, event: KiraMessageEvent, *_):
-        self.media_recognizer.guard_captions(event)
+        await self.media_recognizer.guard_captions(event)
 
     @on.im_message(priority=Priority.HIGH)
     async def on_media_rec_im(self, event: KiraMessageEvent, *_):

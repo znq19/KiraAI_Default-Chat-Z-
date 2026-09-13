@@ -1,4 +1,4 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.8.7
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.8.8
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
@@ -31,6 +31,14 @@
 
 <details>
 <summary>更新日志</summary>
+
+### v1.8.8
+- **紧急修复：官方 VLM 保护网实际未生效（`guard_captions` 漏 `await`）**
+  - **问题**：v1.8.7 新增的保护网钩子 `guard_official_vlm` 调用 `guard_captions()` 时**漏了 `await`**——`guard_captions` 是协程，不同步 `await` 就**一行都不会执行**。运行时只留下一条 `RuntimeWarning: coroutine 'ParallelMediaRecognizer.guard_captions' was never awaited`（不抛异常），表现为：**保护网完全失效，官方付费识图照旧发生**
+  - **修复**：补上 `await`
+  - **为什么 v1.8.7 的测试没发现**：原测试**直接 `await p.guard_captions(...)`**，绕过了真正出问题的钩子 `guard_official_vlm`。本次新增 `tests/test_guard_await.py`：**通过真实钩子**调用并断言占位生效、无 `never awaited` 警告；并用 AST 静态扫描兜住任何"async 方法当同步调用"的写法
+  - 附带逐行核对了 Z 版全部同名方法调用点，确认**仅此一处**漏 `await`
+- 版本 v1.8.7 → v1.8.8
 
 ### v1.8.7
 - **新增「官方 VLM 保护网」**（`guard_framework_vlm`，默认开）：框架自己那条付费识图链路被彻底堵住
