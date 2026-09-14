@@ -403,7 +403,7 @@
       "at_enabled": {
         "type": "switch",
         "name": "连续 at检测",
-        "default": true,
+        "default": false,
         "hint": "时间窗内连续 at次数达阈值时通知 bot"
       },
       "at_window_seconds": {
