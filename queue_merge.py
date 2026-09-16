@@ -267,6 +267,29 @@ class BatchMergeScheduler:
         if need_push:
             await self._push_pending(sid, event.event_id)
 
+    async def on_final_result(self, event: KiraMessageBatchEvent, final_result=None, *_):
+        """ON_FINAL_RESULT（框架 v2.34.4 起真正派发，KiraAI #308）：一轮 agent 执行结束的
+        **权威信号**（agent 循环结束、消息已发出、记忆未写入；被 stop 的轮照样派发）。
+
+        只为兜底推送 pending，覆盖 ON_STEP_RESULT 覆盖不到的一条路径：
+        最后一步发送在 `AFTER_XML_PARSE` 阶段被 stop → `send_llm_text` 提前 `return False`
+        → **ON_STEP_RESULT 根本不会派发** → `_final_marked` 早已置位却没人来推 →
+        in-flight 挂着、pending 干等 stall 超时（默认约 180s）。
+
+        幂等：`_push_pending` 锁内要求 in-flight 仍是本事件才执行；正常一轮（ON_STEP_RESULT
+        已推过）此时 in-flight 已换成新批次 → 直接跳过；没有 pending 时也只清 in-flight
+        （本轮确实结束了，清掉是正确的）。"""
+        if not self.enabled:
+            return
+        try:
+            sid = event.session.sid
+        except Exception:
+            return
+        if self._inflight.get(sid) != event.event_id:
+            return
+        self._log(sid, f"ON_FINAL_RESULT 兜底：本轮 {event.event_id} 结束，检查 pending")
+        await self._push_pending(sid, event.event_id)
+
     @staticmethod
     def _is_stopped(event) -> bool:
         """该批次事件是否已经被 stop()（= 这一轮不会再有任何收尾事件）。

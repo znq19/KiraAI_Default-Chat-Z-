@@ -165,6 +165,13 @@ class DebouncePlugin(BasePlugin):
         #   达到 max_buffer_messages 即满即推；批次内唤醒/普通消息一视同仁（不重置）
         self.batch_started: dict[str, bool] = {}
         self.batch_count: dict[str, int] = {}
+        # - real_batches[event_id]: 该批次事件**确实经过 ON_LLM_REQUEST**（= 框架的真实一轮）。
+        #   用于挡住"外来事件"：第三方插件会自造 KiraMessageBatchEvent 并用它派发
+        #   ON_LLM_RESPONSE（例：子代理插件的 _make_stub_event 携带真实会话 sid），
+        #   下面的 on_llm_response_enhance 会把子代理的最终汇报当成主 bot 的回复
+        #   （存在感 +1、扣分）。真实批次 100% 经过 ON_LLM_REQUEST，据此判定。
+        #   TTL + 上限见 _remember_real_batch（防长时间运行无界增长）。
+        self._real_batches: dict[str, float] = {}
         bot_cfg = ctx.config["bot_config"].get("bot", {})
         self.debounce_interval = _safe_float(bot_cfg.get("max_message_interval"), 1.5)
         self.max_buffer_messages = _safe_int(bot_cfg.get("max_buffer_messages"), 3)
@@ -912,9 +919,13 @@ class DebouncePlugin(BasePlugin):
                         buffer.pop(count=buffer.get_length()-self.max_unmentioned_messages+1)
                 # 批次已开始：不裁剪（批次内消息只进不出，直到满即推/顺延到点）
                 event.buffer()
-                # 消息已确定进入批次 → 立刻后台预取媒体（含此前被判定"不识别"的）：
-                # 上一个批次的 LLM 正在跑 / 本批次在队列排队，这段时间正好用来识别
-                self.media_recognizer.schedule_prefetch(sid, [event.message])
+                # 消息已确定进入批次 → 打标记；真正的后台预取放在 stage1 末尾
+                # （媒体登记进 _pir_media 之后）——见 media_recognize.on_im_message。
+                # ⚠ 不能在这里直接 schedule：预取 worker 会在 stage1 的第一次 await
+                #   （_cache_get → 数据库查询 / URL 图片下载）时抢跑，那时媒体还没登记
+                #   → 读到空 → 预取失效（v1.8.4~v1.8.8 的实际状况：识别只能等到批次
+                #   被推送的 stage2，被拦截不跑 stage2 的批次更是永远空占位）。
+                event.message._batch_entered = True
                 if _batch_on:
                     # 批次计数 +1，满即推检查
                     self.batch_count[sid] = self.batch_count.get(sid, 0) + 1
@@ -961,9 +972,8 @@ class DebouncePlugin(BasePlugin):
 
         # === 唤醒消息：启动/延续批次 ===
         event.buffer()
-        # 消息已确定进入批次 → 立刻后台预取媒体（含此前被判定"不识别"的）：
-        # 上一个批次的 LLM 正在跑 / 本批次在队列排队，这段时间正好用来识别
-        self.media_recognizer.schedule_prefetch(sid, [event.message])
+        # 同上（唤醒消息）：媒体已确定进批次 → 打标记，预取由 stage1 末尾统一调度
+        event.message._batch_entered = True
         if not self.batch_started.get(sid, False):
             # 首个唤醒消息：批次开始，计数从 1（含唤醒本身）
             self.batch_started[sid] = True
@@ -1077,8 +1087,56 @@ class DebouncePlugin(BasePlugin):
     async def on_queue_merge_batch(self, event: KiraMessageBatchEvent, *_):
         await self.merge_scheduler.on_batch_message(event)
 
+    # ---------- 真实批次登记（挡外来事件） ----------
+    @on.llm_request(priority=Priority.HIGH)
+    async def _remember_real_batch(self, event: KiraMessageBatchEvent, *_):
+        """登记"框架真实批次"：ON_LLM_REQUEST 是框架自己一轮 agent 开始前的必经钩子
+        （core/message_manager.py，只有 handle_im_batch_message 会派发），任何**自造
+        事件**（第三方插件用 KiraMessageBatchEvent 造桩，例：子代理插件的
+        _make_stub_event，携带真实会话 sid）都不会经过这里。
+
+        用途见 `_is_real_batch`：on_llm_response 只处理登记过的事件，避免把子代理等
+        后台任务的输出当成主 bot 的回复（存在感统计被带偏）。"""
+        try:
+            eid = getattr(event, "event_id", None)
+            if not eid:
+                return
+            now = time.time()
+            self._real_batches[eid] = now
+            # 有界清理：TTL 10 分钟 + 上限 256（正常一轮几秒~几分钟，不会误清在跑的轮）
+            if len(self._real_batches) > 256:
+                cutoff = now - 600
+                self._real_batches = {k: v for k, v in self._real_batches.items() if v > cutoff}
+                if len(self._real_batches) > 256:
+                    for k in list(self._real_batches)[: len(self._real_batches) - 256]:
+                        self._real_batches.pop(k, None)
+        except Exception:
+            pass
+
+    def _is_real_batch(self, event: KiraMessageBatchEvent) -> bool:
+        """该事件是不是框架真实一轮（经过 ON_LLM_REQUEST）。
+
+        外来事件（子代理桩事件等）一律视为 False；桩事件若带显式标记
+        （extra["_subagent_stub"] / is_subagent_stub）也直接判 False，双保险。"""
+        try:
+            if getattr(event, "is_subagent_stub", False):
+                return False
+            extra = getattr(event, "extra", None) or {}
+            if isinstance(extra, dict) and extra.get("_subagent_stub"):
+                return False
+            eid = getattr(event, "event_id", None)
+            return bool(eid) and eid in self._real_batches
+        except Exception:
+            # 判定异常时按"真实批次"处理（宁可照旧工作，也不要因为守卫把正常功能关掉）
+            return True
+
     @on.llm_response(priority=Priority.HIGH)
     async def on_llm_response_enhance(self, event: KiraMessageBatchEvent, resp, *_):
+        # 只处理框架真实一轮的响应：第三方插件自造的桩事件（子代理等）不是主 bot 的
+        # 回复，若放行会污染存在感评分
+        if not self._is_real_batch(event):
+            logger.debug(f"[Enhance] 忽略非真实批次事件（外来桩事件）: {getattr(event, 'sid', '')}")
+            return
         # 聊天增强引擎：存在感记录 + 休眠维持期（仅最终文本回复时，工具中间步不记）
         if getattr(resp, "tool_calls", None):
             return
@@ -1105,6 +1163,15 @@ class DebouncePlugin(BasePlugin):
     @on.step_result(priority=Priority.HIGH)
     async def on_queue_merge_step(self, event: KiraMessageBatchEvent, *_):
         await self.merge_scheduler.on_step_result(event)
+
+    @on.final_result(priority=Priority.HIGH)
+    async def on_queue_merge_final(self, event: KiraMessageBatchEvent, final_result=None, *_):
+        """ON_FINAL_RESULT（框架 v2.34.4 起真正派发）＝本轮 agent 执行结束的权威信号。
+
+        用于兜底推送 pending：ON_STEP_RESULT 在**最后一步发送被 stop（AFTER_XML_PARSE
+        阶段）**时不会派发（send_llm_text 提前 return），in-flight 只能干等 stall 超时
+        （默认约 180s）；本钩子在 agent 循环之外派发，一定能到。"""
+        await self.merge_scheduler.on_final_result(event, final_result)
 
     # ================= 并行媒体识别（转发给 ParallelMediaRecognizer） =================
     # 注意：im_message 钩子必须定义在 handle_msg 之后（同优先级按注册顺序执行），

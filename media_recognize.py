@@ -416,6 +416,19 @@ class ParallelMediaRecognizer:
                     if len(self._round_media) > 128:
                         for old_sid in list(self._round_media)[: len(self._round_media) - 64]:
                             self._round_media.pop(old_sid, None)
+                # ★ 真·预取的**唯一正确调度点**：媒体已登记（_pir_media 已写好）之后
+                #   立刻后台识别。宿主在消息确定进批次时（event.buffer() 之后）打了
+                #   _batch_entered 标记，这里只为"确实会进 LLM"的消息预取。
+                #
+                #   ⚠ 为什么不能像 v2.5.13 那样在 handle_msg 里调度：本阶段（stage1）
+                #   是**后注册**的钩子，handle_msg 里 create_task 的预取 worker 会在
+                #   本阶段的第一次 await（_cache_get → 数据库查询 / URL 图片下载，必然
+                #   让出事件循环）时抢先运行 —— 那时 _pir_media 还没写入 → worker 读到
+                #   空 → 直接返回（一次性任务，不重试）→ 预取形同虚设，识别只能等到
+                #   批次被推送的 stage2（用户感觉"等推批次才识别"；被其它插件拦截、
+                #   stage2 不跑的批次更是永远拿不到描述）。
+                if _sid and getattr(event.message, "_batch_entered", False):
+                    self.schedule_prefetch(_sid, [event.message])
         except Exception:
             logger.exception("stage1 error")
 
@@ -762,10 +775,15 @@ class ParallelMediaRecognizer:
     def schedule_prefetch(self, sid: str, messages) -> None:
         """非阻塞入口：把这些消息里的媒体丢给后台识别。
 
-        调用时机 = 「消息已确定进入批次」（handle_msg 里 event.buffer() 之后）：
-        此时它一定会被送进 LLM，识别不会白做；而这段时间多半正是
-        「上一个批次的 LLM 还在跑 / 本批次在队列里排队」的空窗 —— 正好用掉。
-        被 discard 的消息走不到这里 → 不会浪费 VLM。
+        调用时机 = 「消息已确定进入批次」**且 stage1 已把媒体登记进 `_pir_media` 之后**
+        （media_recognize.on_im_message 末尾，由宿主的 `_batch_entered` 标记触发）。
+        这段时间多半正是「上一个批次的 LLM 还在跑 / 本批次在防抖窗口里排队」的空窗
+        —— 正好用掉：放行时 stage2 直接命中结果池，关键路径零识别开销；被其它插件
+        拦截（不跑 stage2）的批次也能带上描述而不是空占位。
+
+        ⚠️ 不要在 handle_msg（先注册的钩子）里调用：预取 worker 会在 stage1 的第一次
+        await 时抢跑，那时 `_pir_media` 还是空的 → worker 读到空直接返回（一次性任务
+        不重试）→ 预取失效（v2.5.13~v2.5.17 的实际状况）。
         """
         if not self.enabled or not self.prefetch_enabled:
             return
@@ -803,6 +821,7 @@ class ParallelMediaRecognizer:
                     pool.pop(old, None)
             batch_img_sem = asyncio.Semaphore(max(1, self.max_parallel_images))
             batch_aud_sem = asyncio.Semaphore(max(1, self.max_parallel_audios))
+            started = 0
             for media_id, info in media.items():
                 if self._has_desc(sid, media_id) or media_id in self._pf_tasks:
                     continue          # 已有描述 → 不重复；正在飞 → 去重（失败后允许再试）
@@ -816,6 +835,13 @@ class ParallelMediaRecognizer:
                 self._pf_infos[media_id] = info
                 task.add_done_callback(
                     lambda t, mid=media_id, inf=info, pl=pool: self._prefetch_done(mid, inf, pl)
+                )
+                started += 1
+            if started:
+                # 可观测性：确认"进批次即识别"真的启动了（而不是等推批次）
+                logger.info(
+                    f"[MediaRecognize] 预取启动 {started} 项（{sid}，消息已进批次，"
+                    f"后台识别中，不阻塞主流程）"
                 )
         except Exception as e:
             logger.debug(f"prefetch worker failed: {type(e).__name__}: {e}")
