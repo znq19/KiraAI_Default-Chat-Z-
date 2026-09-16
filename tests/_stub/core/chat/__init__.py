@@ -25,6 +25,11 @@ class Session:
     def sid(self):
         return f"{self.adapter_name}:{self.session_type}:{self.session_id}"
 
+    # 与框架 core/chat/session.py 一致：str(session) == sid
+    # （宿主代码里用 ctx.get_buffer(str(event.session)) 取缓冲，缺这个会取到错的键）
+    def __str__(self):
+        return self.sid
+
 
 class MessageChain:
     def __init__(self, elements=None):

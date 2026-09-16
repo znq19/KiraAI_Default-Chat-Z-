@@ -919,14 +919,17 @@ class DebouncePlugin(BasePlugin):
                         buffer.pop(count=buffer.get_length()-self.max_unmentioned_messages+1)
                 # 批次已开始：不裁剪（批次内消息只进不出，直到满即推/顺延到点）
                 event.buffer()
-                # 消息已确定进入批次 → 打标记；真正的后台预取放在 stage1 末尾
-                # （媒体登记进 _pir_media 之后）——见 media_recognize.on_im_message。
-                # ⚠ 不能在这里直接 schedule：预取 worker 会在 stage1 的第一次 await
-                #   （_cache_get → 数据库查询 / URL 图片下载）时抢跑，那时媒体还没登记
-                #   → 读到空 → 预取失效（v1.8.4~v1.8.8 的实际状况：识别只能等到批次
-                #   被推送的 stage2，被拦截不跑 stage2 的批次更是永远空占位）。
-                event.message._batch_entered = True
+                # 预取标记：只有**确定会被送进 LLM 的消息**才打（v1.8.10 收紧作用域）。
+                #   · 批次已开启（_batch_on）→ 本条属本批，必被 flush → 打标记 ✓
+                #   · 前文阶段 → 只是上下文：可能永远等不到唤醒，也可能窗口满被弹掉
+                #     → **不打标记、不预取**（避免白烧 VLM）；真被带上时由 stage2 现场识别，
+                #     而起批那一刻宿主会用 _warmup_context_media() 把前文预热（零浪费）。
+                #   （本条自己触发主动回复被推出时，另在 flush 前补标记。）
+                # 真正的调度在 stage1 末尾（媒体登记进 _pir_media 之后）——见
+                # media_recognize.on_im_message；不能在这里直接 schedule：预取 worker 会在
+                # stage1 的第一次 await 时抢跑，读到空媒体表 → 预取失效。
                 if _batch_on:
+                    event.message._batch_entered = True
                     # 批次计数 +1，满即推检查
                     self.batch_count[sid] = self.batch_count.get(sid, 0) + 1
                     if self.max_buffer_messages > 0 and self.batch_count[sid] >= self.max_buffer_messages:
@@ -965,6 +968,8 @@ class DebouncePlugin(BasePlugin):
                     # 评分补正：评分不足概率命中作废；评分够概率未命中补触发
                     if _gate:
                         logger.info("[Chat] Triggered proactive chat")
+                        # 本条会被立即推出（连同它的媒体）→ 补预取标记（stage1 末尾调度）
+                        event.message._batch_entered = True
                         event.flush()
             else:
                 event.discard()
@@ -978,6 +983,11 @@ class DebouncePlugin(BasePlugin):
             # 首个唤醒消息：批次开始，计数从 1（含唤醒本身）
             self.batch_started[sid] = True
             self.batch_count[sid] = 1
+            # ★ 起批预热（v1.8.10）：缓冲里的「前文」会随本批一起送进 LLM，而
+            #   "起批 → 顺延到点"这段本来就是等待窗口 → 现在就把它们的媒体预热，
+            #   放行时零识别开销。不含本条（它自己的 stage1 登记还没跑，会被读成空；
+            #   本条由上面的 _batch_entered 标记在 stage1 末尾调度）。
+            self._warmup_context_media(sid, event)
         else:
             # 批次中的唤醒消息：只当普通消息计数，不重置批次
             self.batch_count[sid] = self.batch_count.get(sid, 0) + 1
@@ -994,6 +1004,30 @@ class DebouncePlugin(BasePlugin):
         if sid not in self.session_tasks:
             self.session_tasks[sid] = asyncio.create_task(self._debounce_loop(sid))
         self.session_events[sid].set()
+
+    def _warmup_context_media(self, sid: str, event) -> None:
+        """起批时把缓冲里「前文」的媒体丢进预取池（它们会随本批一起送进 LLM）。
+
+        为什么安全、不浪费：
+          · 前文在唤醒出现后即被**锁定**（裁剪只发生在前文阶段的非唤醒路径），
+            本批次一定会把它们一起送去 LLM；
+          · 只把"消息"交给预取 worker —— 它在 worker 内按 stage1 登记的 `_pir_media`
+            过滤（尊重"仅唤醒识别 / 概率未中 / 超上限"的跳过标记），不会把本不该
+            识别的图送出去；
+          · 结果池与在飞任务都会去重（_has_desc / _pf_tasks），不会重复烧 VLM。
+        """
+        try:
+            buf = self.ctx.get_buffer(str(event.session))
+            cur = getattr(event, "message", None)
+            msgs = []
+            for item in list(getattr(buf, "buffer", None) or []):
+                m = getattr(item, "message", item)
+                if m is not None and m is not cur:
+                    msgs.append(m)
+            if msgs:
+                self.media_recognizer.schedule_prefetch(sid, msgs, reason="起批预热前文")
+        except Exception as e:
+            logger.debug(f"[MediaRecognize] 起批预热前文失败（忽略）: {type(e).__name__}: {e}")
 
     async def _debounce_loop(self, sid: str):
         event = self.session_events[sid]
