@@ -33,6 +33,17 @@ class MessageChain:
     def __iter__(self):
         return iter(self.message_list)
 
+    # 与框架 core/chat/message_utils.py 的 MessageChain 对齐：媒体模块会按索引
+    # 读/写元素（_flatten_forwards / _walk_chain），缺 len/下标会让 stage1 直接异常
+    def __len__(self):
+        return len(self.message_list)
+
+    def __getitem__(self, idx):
+        return self.message_list[idx]
+
+    def __setitem__(self, idx, value):
+        self.message_list[idx] = value
+
     def text(self, t):
         from core.chat.message_elements import Text
         self.message_list.append(Text(t))

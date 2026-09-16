@@ -176,6 +176,9 @@ class BatchMergeScheduler:
         self._pending: dict[str, list[PendingBatch]] = {}   # sid -> 待推送队列
         self._lock = asyncio.Lock()
         self._merge_task: Optional[asyncio.Task] = None
+        # 兜底节拍的唤醒信号（见 _ensure_task_locked / _tick_loop）：
+        # 有 pending 时立刻唤醒重算截止点，空闲时按 _next_watch_delay 懒睡
+        self._tick_wake = asyncio.Event()
 
     # ================= 调试日志 =================
 
@@ -191,6 +194,7 @@ class BatchMergeScheduler:
         if not self.enabled:
             return
         sid = event.session.sid
+        _push_now = None
         async with self._lock:
             # 自己推送的（合并/重放）批次：_qm_self 自发布标记直接放行（双保险，
             # 不依赖 in-flight 匹配——异步窗口/重复事件下 in-flight 可能已被误清）。
@@ -219,12 +223,23 @@ class BatchMergeScheduler:
                 pend_n = len(self._pending[sid])
                 self._log(sid, f"拦截批次 {event.event_id} 进 pending（pending={pend_n}）")
                 self._ensure_task_locked()
+                # ★ 若当前 in-flight 其实**已被 stop**（停止词 / 交棒 / 批他插件在批次
+                #   阶段掐停）：它不会再有任何收尾事件，别让这批消息等下一次兜底节拍，
+                #   锁外立刻走推送决策（0 延迟）。真正的校验仍在 _push_pending 锁内
+                #   （in-flight 必须仍是它），所以这里只是"提前叫醒"，不会误推。
+                _inflight_eid = self._inflight.get(sid)
+                if _inflight_eid and self._is_stopped(self._inflight_event.get(sid)):
+                    _push_now = _inflight_eid
             else:
                 # 空闲 -> 放行
                 self._inflight[sid] = event.event_id
                 self._inflight_event[sid] = event
                 self._inflight_since[sid] = time.time()
                 self._log(sid, f"放行批次 {event.event_id}")
+        # 锁外推送（_push_pending 自己取锁；锁内调用会死锁）
+        if _push_now:
+            self._log(sid, f"in-flight {_push_now} 已被 stop，立即推送 pending（不等节拍）")
+            await self._push_pending(sid, _push_now)
 
     async def on_llm_response(self, event: KiraMessageBatchEvent, resp: LLMResponse, *_):
         """ON_LLM_RESPONSE：任何响应都刷新 in-flight 活动计时（LLM 慢但活着 = 不判卡死）；
@@ -266,6 +281,29 @@ class BatchMergeScheduler:
                 need_push = True
         if need_push:
             await self._push_pending(sid, event.event_id)
+
+    async def on_final_result(self, event: KiraMessageBatchEvent, final_result=None, *_):
+        """ON_FINAL_RESULT（框架 v2.34.4 起真正派发，KiraAI #308）：一轮 agent 执行结束的
+        **权威信号**（agent 循环结束、消息已发出、记忆未写入；被 stop 的轮照样派发）。
+
+        只为兜底推送 pending，覆盖 ON_STEP_RESULT 覆盖不到的一条路径：
+        最后一步发送在 `AFTER_XML_PARSE` 阶段被 stop → `send_llm_text` 提前 `return False`
+        → **ON_STEP_RESULT 根本不会派发** → `_final_marked` 早已置位却没人来推 →
+        in-flight 挂着、pending 干等 stall 超时（默认约 180s）。
+
+        幂等：`_push_pending` 锁内要求 in-flight 仍是本事件才执行；正常一轮（ON_STEP_RESULT
+        已推过）此时 in-flight 已换成新批次 → 直接跳过；没有 pending 时也只清 in-flight
+        （本轮确实结束了，清掉是正确的）。"""
+        if not self.enabled:
+            return
+        try:
+            sid = event.session.sid
+        except Exception:
+            return
+        if self._inflight.get(sid) != event.event_id:
+            return
+        self._log(sid, f"ON_FINAL_RESULT 兜底：本轮 {event.event_id} 结束，检查 pending")
+        await self._push_pending(sid, event.event_id)
 
     @staticmethod
     def _is_stopped(event) -> bool:
@@ -491,14 +529,61 @@ class BatchMergeScheduler:
 
     # ================= 兜底 tick（仅 in-flight 卡死） =================
 
+    # 空闲（没有任何 pending）时的懒轮询间隔（纯保险，不再固定 0.5s 空转）
+    IDLE_WATCH_INTERVAL = 5.0
+    # 发现"in-flight 已被 stop"时的最短复查间隔
+    STOPPED_RECHECK_INTERVAL = 0.05
+
     def _ensure_task_locked(self):
         if self._merge_task is None or self._merge_task.done():
             self._merge_task = asyncio.create_task(self._tick_loop())
+        # 有新 pending：立刻叫醒兜底节拍重算截止点（不会因此晚处理）
+        try:
+            self._tick_wake.set()
+        except Exception:
+            pass
+
+    def _next_watch_delay(self) -> float:
+        """下一次兜底检查还要睡多久——贴着**最近的截止点**，而不是固定 0.5s 空转。
+
+        - 没有任何 pending → 懒睡 IDLE_WATCH_INTERVAL（最后一道保险）；
+        - 有 pending 且 in-flight 已被 stop → STOPPED_RECHECK_INTERVAL（尽快处理，
+          与事件驱动路径互为保险）；
+        - 否则取「卡死兜底剩余时间」与「攒批窗口剩余时间」的较小值。
+
+        `_tick` 本身的判断逻辑完全不变，只是被叫醒的时机更准：既不空转，
+        也不会比旧版（每 0.5s 必醒）晚处理任何已知路径。
+        """
+        if not self._pending:
+            return self.IDLE_WATCH_INTERVAL
+        now = time.time()
+        delay = self.IDLE_WATCH_INTERVAL
+        for sid, pending in self._pending.items():
+            if not pending:
+                continue
+            if self._inflight.get(sid) and self._is_stopped(self._inflight_event.get(sid)):
+                return self.STOPPED_RECHECK_INTERVAL
+            candidates = []
+            if (self._inflight.get(sid) and sid not in self._final_marked
+                    and self.inflight_stall_timeout > 0):
+                candidates.append(
+                    self.inflight_stall_timeout - (now - self._inflight_since.get(sid, now))
+                )
+            if self.max_merge_seconds > 0:
+                candidates.append(self.max_merge_seconds - (now - pending[0].arrival_ts))
+            if candidates:
+                delay = min(delay, max(self.STOPPED_RECHECK_INTERVAL, min(candidates)))
+        return delay
 
     async def _tick_loop(self):
         try:
             while True:
-                await asyncio.sleep(0.5)
+                self._tick_wake.clear()
+                try:
+                    await asyncio.wait_for(self._tick_wake.wait(),
+                                           timeout=self._next_watch_delay())
+                except asyncio.TimeoutError:
+                    pass
                 await self._tick()
         except asyncio.CancelledError:
             return
