@@ -428,7 +428,7 @@ class ParallelMediaRecognizer:
                 #   批次被推送的 stage2（用户感觉"等推批次才识别"；被其它插件拦截、
                 #   stage2 不跑的批次更是永远拿不到描述）。
                 if _sid and getattr(event.message, "_batch_entered", False):
-                    self.schedule_prefetch(_sid, [event.message])
+                    self.schedule_prefetch(_sid, [event.message], reason="进批次即识别")
         except Exception:
             logger.exception("stage1 error")
 
@@ -772,7 +772,7 @@ class ParallelMediaRecognizer:
                         stack.append(fwd)
         return ids
 
-    def schedule_prefetch(self, sid: str, messages) -> None:
+    def schedule_prefetch(self, sid: str, messages, reason: str = "") -> None:
         """非阻塞入口：把这些消息里的媒体丢给后台识别。
 
         调用时机 = 「消息已确定进入批次」**且 stage1 已把媒体登记进 `_pir_media` 之后**
@@ -791,11 +791,11 @@ class ParallelMediaRecognizer:
         if not msgs:
             return
         try:
-            asyncio.create_task(self._prefetch_worker(sid, msgs))
+            asyncio.create_task(self._prefetch_worker(sid, msgs, reason))
         except Exception as e:
             logger.debug(f"prefetch schedule failed: {type(e).__name__}: {e}")
 
-    async def _prefetch_worker(self, sid: str, messages) -> None:
+    async def _prefetch_worker(self, sid: str, messages, reason: str = "") -> None:
         """收集待识别媒体 → 起后台识别任务（与 stage2 共用缓存 / 限流 / 结果池）。"""
         try:
             if self._pir_active() or self._native_mode(sid):
@@ -840,8 +840,8 @@ class ParallelMediaRecognizer:
             if started:
                 # 可观测性：确认"进批次即识别"真的启动了（而不是等推批次）
                 logger.info(
-                    f"[MediaRecognize] 预取启动 {started} 项（{sid}，消息已进批次，"
-                    f"后台识别中，不阻塞主流程）"
+                    f"[MediaRecognize] 预取启动 {started} 项（{sid}，"
+                    f"{reason or '后台识别'}，不阻塞主流程）"
                 )
         except Exception as e:
             logger.debug(f"prefetch worker failed: {type(e).__name__}: {e}")
