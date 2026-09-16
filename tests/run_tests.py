@@ -11,7 +11,8 @@ import pathlib
 HERE = pathlib.Path(__file__).resolve().parent
 PLUGIN = HERE.parent
 
-SUITES = ["test_guard_await.py", "test_prefetch_timing.py", "test_foreign_event.py"]
+SUITES = ["test_guard_await.py", "test_prefetch_timing.py", "test_foreign_event.py",
+          "test_queue_timing.py"]
 
 rc = 0
 for suite in SUITES:
