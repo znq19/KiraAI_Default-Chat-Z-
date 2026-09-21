@@ -555,6 +555,11 @@ class BatchMergeScheduler:
         也不会比旧版（每 0.5s 必醒）晚处理任何已知路径。
         """
         if not self._pending:
+            # 无 pending 但存在"in-flight 已 stop"的悬挂会话时，尽快醒来清场
+            # （_tick 的清场分支），否则懒睡 IDLE_WATCH_INTERVAL
+            for sid, eid in self._inflight.items():
+                if eid and self._is_stopped(self._inflight_event.get(sid)):
+                    return self.STOPPED_RECHECK_INTERVAL
             return self.IDLE_WATCH_INTERVAL
         now = time.time()
         delay = self.IDLE_WATCH_INTERVAL
@@ -594,6 +599,17 @@ class BatchMergeScheduler:
         to_publish = []
         async with self._lock:
             now = time.time()
+            # 清场：in-flight 已被 stop 但该 sid 无 pending（如批次被 KSM 组锁拦停后
+            # 悬挂）——不会再来任何收尾事件，等到下一条消息/stall 兜底才清会白压会话
+            # 状态（多一跳延迟）。走与 on_batch/收尾路径相同的 _decide_and_apply_locked
+            # 清理逻辑（无 pending 时只清 in-flight 状态，返回 None 不推送）
+            for sid in list(self._inflight):
+                if self._pending.get(sid):
+                    continue                       # 有 pending 的走下面的推送决策
+                ev = self._inflight_event.get(sid)
+                if ev is not None and self._is_stopped(ev):
+                    self._log(sid, "in-flight 已 stop 且无 pending，清场释放会话状态")
+                    self._decide_and_apply_locked(sid)
             for sid in list(self._pending):
                 pending = self._pending.get(sid)
                 if not pending:

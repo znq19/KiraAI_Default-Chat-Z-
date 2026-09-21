@@ -944,6 +944,11 @@ class ChatEnhanceEngine:
 
     def on_im_message(self, event) -> None:
         """在宿主 handle_msg 中调用：存在感记录 + 骚扰检测 + 休眠判定。"""
+        # 系统/通知事件不计入统计：bot 自己的通知、主动回复/定时任务等系统触发事件
+        # 不是用户发言——计入会压低存在感占比（更话痨）、误触骚扰通知、休眠期被
+        # try_wake 叫醒。poke 戳一戳除外（真实用户互动，骚扰检测需要）
+        if self._is_system_event(event):
+            return
         sid = event.session.sid
         now = time.time()
         is_dm = not getattr(event, "is_group_message", lambda: True)()
@@ -1026,8 +1031,42 @@ class ChatEnhanceEngine:
             if mentioned and self.presence.score(sid, now) < self.presence.score_threshold:
                 event._enhance_force_suppressed = True
 
+    # 系统触发事件的 sender.user_id（宿主构造的主动回复/定时任务/系统消息）：
+    # 不算用户发言，不计入存在感/骚扰/休眠统计
+    _SYSTEM_SENDER_IDS = {"system_proactive_dm", "system_scheduled", "system_message"}
+
+    def _is_system_event(self, event) -> bool:
+        """系统/通知事件判定：系统 sender（含 system_ 前缀）或无内容的系统通知。
+
+        poke 戳一戳（is_notice 但 sub_type=poke）除外——那是真实用户互动，
+        骚扰检测与存在感统计需要它。
+        """
+        try:
+            sender = getattr(getattr(getattr(event, "message", None), "sender", None), "user_id", "")
+            sender = str(sender or "")
+            if sender in self._SYSTEM_SENDER_IDS or sender.startswith("system_"):
+                return True
+            if getattr(event, "is_notice", False):
+                raw = getattr(event, "raw_message", None)
+                if raw is None:
+                    raw = getattr(getattr(event, "message", None), "raw_message", None)
+                is_poke = isinstance(raw, dict) and raw.get("notice_type") == "notify" \
+                    and raw.get("sub_type") == "poke"
+                return not is_poke
+        except Exception:
+            pass
+        return False
+
     def _detect_kind(self, event) -> Optional[str]:
         """识别事件类型：戳/at/关键词/引用。"""
+        # 系统触发事件（主动回复/定时任务/系统消息）：不参与骚扰判定（不计 at、不 try_wake）
+        try:
+            sender = getattr(getattr(getattr(event, "message", None), "sender", None), "user_id", "")
+            sender = str(sender or "")
+            if sender in self._SYSTEM_SENDER_IDS or sender.startswith("system_"):
+                return None
+        except Exception:
+            pass
         # 戳一戳：notice 事件
         if getattr(event, "is_notice", False):
             raw = getattr(event, "raw_message", None)

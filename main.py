@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextvars
 import io
 import json
 import os
@@ -35,6 +36,14 @@ from chat_enhance import ChatEnhanceEngine, _safe_int, _safe_float
 
 
 _SELF_PLUGIN_ID = "default-chat（z）"
+
+
+# 当前任务上下文里「正在处理的 LLM 响应所属会话」（ignore/wake_extend tag 处理器用）。
+# 框架 ON_LLM_RESPONSE 钩子与随后的 XML tag 解析执行在同一 asyncio task 里
+# （agent_executor 内联 await 钩子 → send_llm_text → _parse_xml_msg），contextvar
+# 沿同一任务链透传 —— tag 处理器据此拿到**本次响应**的 sid，不再依赖全局标量。
+_RESP_SID: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "kira_default_chat_resp_sid", default=None)
 
 
 class DebouncePlugin(BasePlugin):
@@ -330,10 +339,22 @@ class DebouncePlugin(BasePlugin):
             }
         self.enhance = ChatEnhanceEngine(ctx, _enhance_cfg, self, merge_seconds=self.debounce_interval)
 
+        # ignore/wake_extend tag 的会话上下文：sid -> (token, timestamp)。
+        # 框架 tag 处理器签名只有 (value, **attrs) 无 event 上下文，旧实现用单一
+        # self._last_ignore_sid 标量传递，多会话并发回复时 A 会话的 <ignore> 可能
+        # 错作用到 B 会话（跨会话错拉黑）。改为按 sid 精确匹配 + contextvar 传递
+        # 当前响应所属会话 + 60s 过期清理（见 _consume_ignore_sid）。
+        self._ignore_ctx: dict = {}
+
     async def initialize(self):
         logger.info(f"[Debounce] enabled (group media/forward/voice control, private unchanged)")
         # 启动聊天增强引擎（存在感/骚扰/休眠/通知合并）
         self.enhance.start()
+        # 启用媒体识别模块的框架 desc_img 安全接管（幂等；terminate 时还原）
+        try:
+            self.media_recognizer.activate()
+        except Exception:
+            pass
         # 接管互斥：检测功能重叠的插件并自动停用，避免重复处理（延迟翻倍/重复通知）
         #   1) default-chat（框架内置默认聊天）：与本插件同为 IM 消息合并实现，
         #      同时启用会双重防抖/buffer，顺延延迟翻倍、批次计数错乱；且其唤醒词
@@ -444,6 +465,11 @@ class DebouncePlugin(BasePlugin):
             logger.warning(f"[Debounce] 唤醒词迁移写回失败（内存已生效，不影响本次运行）: {e}")
 
     async def terminate(self):
+        # 还原框架 desc_img 接管 + 取消媒体缓存清理等后台任务（幂等）
+        try:
+            await self.media_recognizer.shutdown()
+        except Exception:
+            pass
         for sid, task in list(self.session_tasks.items()):
             if not task.done():
                 task.cancel()
@@ -461,7 +487,7 @@ class DebouncePlugin(BasePlugin):
     _MP3_BR_V1 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0]
     _MP3_BR_V2 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0]
 
-    def _record_bytes(self, elem) -> Optional[bytes]:
+    async def _record_bytes(self, elem) -> Optional[bytes]:
         """尽力取出语音的原始字节（url 不做同步下载，返回 None）"""
         try:
             ft = getattr(elem, "file_type", "")
@@ -472,9 +498,18 @@ class DebouncePlugin(BasePlugin):
                 return base64.b64decode(b64) if b64 else None
             if ft == "path" and os.path.exists(elem.file):
                 if os.path.getsize(elem.file) <= 50 * 1024 * 1024:
-                    with open(elem.file, "rb") as f:
-                        return f.read()
+                    # 同步 open().read() 会阻塞事件循环（大语音文件尤甚）：移出到线程
+                    return await asyncio.to_thread(self._read_file_bytes, elem.file)
             return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _read_file_bytes(path: str) -> Optional[bytes]:
+        """同步读文件字节（供 asyncio.to_thread 调用，不直接在事件循环里用）。"""
+        try:
+            with open(path, "rb") as f:
+                return f.read()
         except Exception:
             return None
 
@@ -505,14 +540,14 @@ class DebouncePlugin(BasePlugin):
         except Exception:
             return 0
 
-    def _estimate_record_duration(self, elem) -> int:
+    async def _estimate_record_duration(self, elem) -> int:
         """Record 缺少 duration 元数据时尽力估算时长（秒），失败返回 0。
 
         典型场景：机器人自己发出的语音被用户引用回来时不带 duration，
         导致长语音限制被绕过。QQ 适配器会把语音统一转成 mp3 base64，
         本地 TTS 文件多为 wav，二者都可估算。
         """
-        data = self._record_bytes(elem)
+        data = await self._record_bytes(elem)
         if not data:
             return 0
         try:
@@ -524,24 +559,50 @@ class DebouncePlugin(BasePlugin):
         except Exception:
             return 0
 
-    def _get_record_duration(self, elem) -> int:
+    async def _get_record_duration(self, elem) -> int:
         """优先读元数据 duration；缺失时从音频字节估算（如被引用的机器人自己的语音）"""
         try:
             duration = int(float(getattr(elem, "duration", 0) or 0))
         except (TypeError, ValueError):
             duration = 0
         if duration <= 0:
-            duration = self._estimate_record_duration(elem)
+            duration = await self._estimate_record_duration(elem)
         return duration
 
     # ========== 骚扰屏蔽 XML tag（戳/at/关键词/引用） ==========
 
+    def _consume_ignore_sid(self) -> Optional[str]:
+        """tag 处理器专用：按**当前响应所属会话**精确取出待消费的 sid（60s 过期）。
+
+        框架 tag 处理器签名只有 (value, **attrs) 无 event 上下文。旧实现用
+        self._last_ignore_sid 标量传递，多会话并发回复时 A 会话的 <ignore> 可能
+        错作用到 B（跨会话错拉黑、静默吞消息）。现在：写侧（on_llm_response）按
+        sid 存 (event_id, ts) 并用 contextvar 透传当前响应 sid；读侧按 contextvar
+        精确匹配 + 消费（弹出，一次性）。contextvar 缺失（旧框架/异常路径）时仅在
+        唯一候选时兜底使用，宁可不生效也不错会话。
+        """
+        now = time.time()
+        ctx_map = getattr(self, "_ignore_ctx", None)
+        if not isinstance(ctx_map, dict):
+            return None
+        # 60s 过期清理
+        for _k, (_tk, _ts) in list(ctx_map.items()):
+            if now - _ts > 60:
+                ctx_map.pop(_k, None)
+        sid = _RESP_SID.get(None)
+        entry = ctx_map.get(sid) if sid else None
+        if entry is None:
+            if sid is not None:
+                return None          # 当前响应会话无待消费记录：绝不猜别的会话
+            if len(ctx_map) != 1:
+                return None          # 上下文缺失且候选不唯一：不猜
+            sid = next(iter(ctx_map))
+        ctx_map.pop(sid, None)
+        return sid
+
     @register.tag(name="wake_extend", description="休眠唤醒后主动续窗。输出 <wake_extend>yes</wake_extend> 延长维持期（受 wake_max_extensions 限制）。")
     async def handle_wake_extend(self, value: str, **kwargs) -> list:
-        try:
-            sid = self._last_ignore_sid
-        except AttributeError:
-            sid = None
+        sid = self._consume_ignore_sid()
         if sid is None:
             return []
         if (value or "").strip().lower() == "yes":
@@ -560,10 +621,7 @@ class DebouncePlugin(BasePlugin):
 
     def _apply_ignore_tag(self, kind: str, value: str) -> list:
         """解析骚扰屏蔽 tag 值并执行屏蔽。返回空列表（tag 不产生消息输出）。"""
-        try:
-            sid = self._last_ignore_sid
-        except AttributeError:
-            sid = None
+        sid = self._consume_ignore_sid()
         if sid is None:
             return []
         result = self.enhance.harass.apply_ignore_from_tag(sid, kind, value)
@@ -688,7 +746,7 @@ class DebouncePlugin(BasePlugin):
             tool_set.remove(*to_remove)
             logger.debug(f"[Enhance] 已从 tool_set 移除工具: {to_remove}")
 
-    def _process_media(self, chain, is_mentioned: bool, is_private: bool = False):
+    async def _process_media(self, chain, is_mentioned: bool, is_private: bool = False):
         """处理消息链中的图片、动画表情、合并转发消息和语音。
 
         v1.7.8 变更（复读兼容 + 官方格式对齐，与 media_recognize v2.3.2 配套）：
@@ -718,9 +776,9 @@ class DebouncePlugin(BasePlugin):
                     if self.forward_recognition_only_on_mention and not is_mentioned:
                         chain.message_list[i] = Text("[转发消息]")
                 elif isinstance(elem, Record):
-                    self._process_record(elem, chain, i, is_mentioned, is_private)
+                    await self._process_record(elem, chain, i, is_mentioned, is_private)
                 elif isinstance(elem, Reply) and elem.chain:
-                    self._process_media(elem.chain, is_mentioned, is_private)
+                    await self._process_media(elem.chain, is_mentioned, is_private)
             return
 
         for i, elem in enumerate(chain.message_list):
@@ -742,13 +800,13 @@ class DebouncePlugin(BasePlugin):
                 if self.forward_recognition_only_on_mention and not is_mentioned:
                     chain.message_list[i] = Text("[转发消息]")
             elif isinstance(elem, Record):
-                self._process_record(elem, chain, i, is_mentioned, is_private)
+                await self._process_record(elem, chain, i, is_mentioned, is_private)
             elif isinstance(elem, Reply) and elem.chain:
-                self._process_media(elem.chain, is_mentioned, is_private)
+                await self._process_media(elem.chain, is_mentioned, is_private)
 
-    def _process_record(self, elem, chain, i: int, is_mentioned: bool, is_private: bool):
+    async def _process_record(self, elem, chain, i: int, is_mentioned: bool, is_private: bool):
         """语音处理（_process_media 与原生多模态路径共用）：长语音限长 + STT 策略 + 占位。"""
-        duration = self._get_record_duration(elem)
+        duration = await self._get_record_duration(elem)
         # 长语音限制
         if self.voice_max_duration > 0 and duration > self.voice_max_duration:
             chain.message_list[i] = Text(f"[长语音 {duration}秒]")
@@ -866,7 +924,7 @@ class DebouncePlugin(BasePlugin):
 
         if event.is_group_message():
             is_mentioned = event.is_mentioned
-            self._process_media(event.message.chain, is_mentioned, is_private=False)
+            await self._process_media(event.message.chain, is_mentioned, is_private=False)
             if not is_mentioned and not self.image_recognition_only_on_mention:
                 self._limit_media_count(event.message.chain, self.max_images_per_message)
             elif is_mentioned and self.max_images_per_message_mentioned > 0:
@@ -875,7 +933,7 @@ class DebouncePlugin(BasePlugin):
         else:
             # 私聊
             is_mentioned = event.is_mentioned
-            self._process_media(event.message.chain, is_mentioned, is_private=True)
+            await self._process_media(event.message.chain, is_mentioned, is_private=True)
             # 私聊中不需要限制图片数量（因为一对一）
 
         # === 聊天增强引擎：存在感记录 + 骚扰检测 + 休眠判定 ===
@@ -894,7 +952,7 @@ class DebouncePlugin(BasePlugin):
                 # 媒体跑 VLM/STT —— 消息最终不触发 LLM，识别成本全部白付（VLM 泄露）。
                 # 这里按「未唤醒」口径重新处理一遍媒体链，与上面的非唤醒路径保持完全一致。
                 try:
-                    self._process_media(event.message.chain, False, is_private=is_dm)
+                    await self._process_media(event.message.chain, False, is_private=is_dm)
                     if not is_dm and not self.image_recognition_only_on_mention:
                         self._limit_media_count(event.message.chain, self.max_images_per_message)
                 except Exception as e:
@@ -1183,12 +1241,22 @@ class DebouncePlugin(BasePlugin):
         if sid and not self.enhance.dormant.can_reply(sid):
             self.enhance.dormant._awake_until.pop(sid, None)
             logger.debug(f"[Enhance] 休眠维持期达最大互动次数，结束: {sid}")
+        # 透传当前响应所属会话（contextvar 沿同一任务链传到随后的 XML tag 解析）
+        try:
+            if sid:
+                _RESP_SID.set(sid)
+        except Exception:
+            pass
         # 记录本次 LLM 回复所属会话（ignore/wake_extend tag 处理器用）。
-        # 必须在最终文本回复时写：框架 tag 处理器无 event 上下文，_last_ignore_sid
-        # 是唯一通道。写入已把竞态窗口缩到最小（on_llm_response 返回后框架才解析
-        # XML 执行 tag，多会话并发回复时可能被覆盖，已知限制）。
+        # 框架 tag 处理器签名只有 (value, **attrs) 无 event 上下文，只能侧信道传递。
+        # v1.8.11 起改为按 sid 精确匹配：sid -> (event_id, ts)，tag 处理器用 contextvar
+        # 里「当前响应的 sid」精确取消费 + 60s 过期清理，消灭多会话并发回复时
+        # <ignore> 错作用到其它会话的竞态（跨会话错拉黑）。
         if sid:
-            self._last_ignore_sid = sid
+            try:
+                self._ignore_ctx[sid] = (getattr(event, "event_id", None), time.time())
+            except Exception:
+                pass
 
     @on.llm_response(priority=Priority.HIGH)
     async def on_queue_merge_resp(self, event: KiraMessageBatchEvent, resp, *_):

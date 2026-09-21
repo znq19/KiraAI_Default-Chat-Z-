@@ -759,6 +759,40 @@
         "default": 60.0,
         "hint": "单张图片/单条语音识别的超时上限，超时跳过该媒体"
       },
+      "download_timeout": {
+        "name": "URL 下载超时(秒)",
+        "type": "float",
+        "default": 15.0,
+        "minimum": 1.0,
+        "hint": "媒体字节 URL 下载的独立超时（与 VLM 推理预算分离）：下载慢/URL 失效时快速失败并归类为「下载失败」，不再吃光整个 media_timeout；VLM 推理仍由 media_timeout 兜底"
+      },
+      "vlm_prefetch_max_parallel": {
+        "name": "预取最大并发",
+        "type": "integer",
+        "default": 4,
+        "minimum": 1,
+        "hint": "排队/在飞空窗的后台预取走独立信号量，不占用 stage2/stage3 关键路径的会话级/全局级信号量（防预取风暴挤占兜底识别）"
+      },
+      "media_cache_enabled": {
+        "name": "到达即落盘（插件媒体缓存）",
+        "type": "switch",
+        "default": true,
+        "hint": "url 型图片/语音在收到时即持久化到 data/plugins_media_cache/ 并设置本地路径——URL 过期后识别/渲染/read_file 全链仍可用（图片过期免疫）"
+      },
+      "media_cache_ttl_hours": {
+        "name": "媒体缓存保留时长(小时)",
+        "type": "float",
+        "default": 24,
+        "minimum": 0.0,
+        "hint": "超过该时长的缓存文件由后台任务清理（在飞/待识别条目引用的文件受保护不删）"
+      },
+      "media_cache_max_mb": {
+        "name": "媒体缓存总量上限(MB)",
+        "type": "integer",
+        "default": 512,
+        "minimum": 1,
+        "hint": "超过上限按 LRU（最久未用）淘汰最旧文件；在飞/待识别条目引用的文件受保护不删"
+      },
       "quality_enabled": {
         "name": "图片压缩识别",
         "type": "switch",

@@ -18,14 +18,30 @@
 - PIR 互斥（pir_auto_disable 默认开）：检测到 parallel_image_reader 启用 → 自动关闭
   （本模块已覆盖其全部能力）；竞态/关闭失败降级让位，绝不双重处理。
 - 缓存：复用框架 image_desc_cache 表；VLM 描述词跟随 WebUI desc_prompt 配置。
+- v2.3.3 健壮性增强（详见 KiraAI插件全量排查与修复方案.md §1.4/§2.4/§4）：
+    * 缓存写入 upsert 带活 last_seen（原 last_seen=0 次日必被框架清理）；
+      失败占位文案（(未识别)/(已过期)/(识别超时)/(下载失败)）不再进持久缓存。
+    * 失败分类：下载失败 / 识别超时 / 未识别 三类占位可区分；URL 下载独立超时
+      （download_timeout，默认 15s），VLM 推理仍由外层 wait_for(media_timeout) 兜底。
+    * 到达即落盘：url 型媒体在 stage1 即持久化到 data/plugins_media_cache/ 并设置
+      elem._temp_path（URL 失效免疫 + 框架 temp_monitor 60s 误删免疫）；URL 失效时
+      凭 message_id 经适配器 get_msg 重取新 URL 重试一次。
+    * 预取并发隔离：预取走独立信号量（vlm_prefetch_max_parallel），不占用
+      stage2/stage3 关键路径的会话级/全局级信号量；预取先落盘再识别。
+    * PIR/native 放行分支也占位 caption=""（堵框架 F1 付费窗口）；
+      框架 desc_img 安全接管（缓存命中零 VLM + wait_for 超时兜底，terminate 还原）。
+    * stage1/stage3 并行化；PIL/重编码等 CPU 操作移出事件循环（asyncio.to_thread）。
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import hashlib
+import os
 import re
+import time
 from io import BytesIO
+from pathlib import Path
 from typing import Optional
 
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
@@ -48,6 +64,10 @@ except Exception:  # 极端兼容：拿不到框架日志器时退回插件 logg
 _IMAGE_RE = re.compile(r"\[Image #([^\]\s:]+): ([^\]]*)\]")
 _RECORD_RE = re.compile(r"\[Record #([^\]\s:]+): ([^\]]*)\]")
 _ALL_RE = re.compile(r"\[(?:Image|Record) #([^\]\s:]+): ([^\]]*)\]")
+
+# 失败占位文案（统一收口）：这些值被 _is_valid_desc 拒绝——不进持久缓存、不当有效描述；
+# 但仍会写进结果池/回填 caption 作为「本轮已处理」占位，防止空占位进 LLM 或重复撞模型。
+_PLACEHOLDER_DESCS = ("(未识别)", "(已过期)", "(识别超时)", "(下载失败)")
 
 # 官方「空占位」：caption 为空时框架渲染成 [Image , file_path: xxx] / [Image ] / [Sticker ]。
 # 已有描述的形式（[Image 描述, file_path: …] / [Sticker 描述]）不会命中本正则。
@@ -81,6 +101,24 @@ class ParallelMediaRecognizer:
         self.stt_max_parallel_per_session = int(sec.get("stt_max_parallel_per_session", 15))
         self.stt_max_parallel_global = int(sec.get("stt_max_parallel_global", 40))
         self.media_timeout = float(sec.get("media_timeout", 60.0))
+        # URL 下载独立超时（默认 15s，与 VLM 推理预算分离）：媒体字节拉取慢 / URL 失效时
+        # 快速失败并归类为 (下载失败)，不再让一次慢下载吃光整个 media_timeout
+        # （外层 wait_for(media_timeout) 仍兜底全程，超时归类 (识别超时)）。
+        self.download_timeout = float(sec.get("download_timeout", 15.0))
+        # 预取并发隔离（默认 4）：预取（排队/在飞空窗的后台预处理）走独立信号量，
+        # 不再占用 stage2/stage3 关键路径的会话级/全局级信号量 —— 多会话图片风暴时
+        # 预取不会挤占兜底识别的并发槽。
+        self.vlm_prefetch_max_parallel = int(sec.get("vlm_prefetch_max_parallel", 4))
+        # 到达即落盘（插件自有媒体缓存，默认开）：url 型媒体在 stage1 即把字节持久化到
+        # data/plugins_media_cache/ 并设置 elem._temp_path —— URL 过期后本地字节仍在
+        # （识别/渲染/read_file 全链免疫），且框架 temp_monitor 的 60s 保护期清理管不到
+        # 插件自有目录。不改 elem.file/file_type，native 模式与框架渲染不受影响。
+        # 目录治理：TTL（media_cache_ttl_hours，默认 24h）+ 总量上限（media_cache_max_mb，
+        # 默认 512MB，LRU 淘汰最旧），后台任务定期清理（terminate 时取消）；
+        # 在飞/待识别条目引用的文件受保护不删（另有 10 分钟宽限期）。
+        self.media_cache_enabled = bool(sec.get("media_cache_enabled", True))
+        self.media_cache_ttl_hours = float(sec.get("media_cache_ttl_hours", 24))
+        self.media_cache_max_mb = int(sec.get("media_cache_max_mb", 512))
         # 并行识图插件（PIR）自动互斥（默认开）：检测到 PIR 处于启用状态时自动关闭它，
         # 图片识别完全由本模块接管（本模块能力已覆盖 PIR：并行 VLM + 缓存 + 限流 + 转发拍平 + 语音）。
         # 运行时实时检测（与 _pir_active 同理），PIR 热插拔/手动开启后自动再次关闭。
@@ -110,6 +148,14 @@ class ParallelMediaRecognizer:
         # 每会话信号量（惰性创建，热重载后自动重建）
         self._session_img_sems: dict[str, asyncio.Semaphore] = {}
         self._session_aud_sems: dict[str, asyncio.Semaphore] = {}
+        # 预取专用信号量（并发隔离，见上）与裸 create_task 强引用集（防 GC 提前回收）
+        self._prefetch_sem = asyncio.Semaphore(max(1, self.vlm_prefetch_max_parallel))
+        self._bg_tasks: set = set()
+        # 媒体缓存清理任务（懒启动，首个 url 媒体落盘时拉起）；
+        # URL 失效重取注册表：media_id -> (message_id, adapter_name)，stage1 登记，
+        # 下载失败时凭它经适配器 get_msg 拿新鲜 URL（napcat 的 get_msg 会刷新 rkey）
+        self._mc_cleanup_task: Optional["asyncio.Task"] = None
+        self._media_source: dict[str, tuple] = {}
 
         # VLM 描述语言：读全局 locale.lang；未设置默认中文（对齐并行识图插件中文 DESC_PROMPT）。
         # 实际 prompt 优先取 WebUI 配置 desc_prompt（§_describe_image），此处 lang 仅作默认兜底
@@ -146,7 +192,7 @@ class ParallelMediaRecognizer:
         logger.debug(msg)
 
     def _pir_active(self) -> bool:
-        """运行时实时检测并行识图插件（PIR）是否已加载，且未被自动互斥关闭。
+        """运行时实时检测并行识图插件（PIR）是否处于**启用**状态。
 
         语义 v2.3.2 起简化（用户确认）：不再"装了就让位/只做音频"——本模块已覆盖并超越
         PIR（并行 VLM、缓存、三层限流、转发拍平、语音 STT 全都有），PIR 的 stage1 会把
@@ -154,6 +200,11 @@ class ParallelMediaRecognizer:
         因此 pir_auto_disable=True（默认）时：检测到 PIR 启用 → 自动 set_plugin_enabled(False)
         关闭它，图片完全归本模块；关闭失败/竞态（本轮事件 PIR 已先替换）时降级为旧语义
         （图片归 PIR、本模块只做音频），绝不双重处理。
+
+        v2.3.3 竞态收口：直接**同步**查插件注册表启用状态（plugin_mgr.is_plugin_enabled
+        是纯内存 dict 查询）。框架 set_plugin_enabled(False) 先翻标志位再 terminate 摘
+        handler —— 自动关闭任务一旦开始执行，本判定立即返回 False，消除旧实现"已加载但
+        handler 未摘除"的误判窗口（该窗口内 guard 放行留 caption=None → 框架 F1 付费识图）。
         """
         try:
             pm = getattr(self.ctx, "plugin_mgr", None)
@@ -162,14 +213,26 @@ class ParallelMediaRecognizer:
             inst = pm.get_plugin_inst("parallel_image_reader")
             if inst is None:
                 return False
-            # PIR 已加载：auto-disable 开启则尝试自动关闭（只关一次，防每事件重复 terminate）
-            if self.pir_auto_disable:
+            # 同步查注册表启用状态（内存 dict，微秒级）；接口异常时保守按"启用"让位
+            try:
+                enabled = pm.is_plugin_enabled("parallel_image_reader")
+                if asyncio.iscoroutine(enabled):   # 旧版异步接口：拿不到结果，保守让位
+                    try:
+                        enabled.close()
+                    except Exception:
+                        pass
+                    enabled = True
+            except Exception:
+                enabled = True
+            # PIR 已加载且启用：auto-disable 开启则自动关闭（只关一次，防每事件重复 terminate）；
+            # 裸 task 挂 _bg_tasks 持强引用，防 GC 提前回收
+            if enabled and self.pir_auto_disable:
                 if not getattr(self, "_pir_disable_attempted", False):
                     self._pir_disable_attempted = True
-                    asyncio.create_task(self._auto_disable_pir())
-                # 本轮事件：PIR 处于启用态，stage1 可能已先替换——降级让位，避免双重处理
-                return True
-            return True  # 互斥关闭：图片归 PIR，本模块只做音频（旧语义）
+                    task = asyncio.create_task(self._auto_disable_pir())
+                    self._bg_tasks.add(task)
+                    task.add_done_callback(self._bg_tasks.discard)
+            return bool(enabled)
         except Exception:
             return False
 
@@ -347,9 +410,13 @@ class ParallelMediaRecognizer:
             按"仅唤醒识别/概率/超限"决定，省 VLM 的语义完全不变；
           · 不改任何消息策略（不 buffer/discard/stop），不删不换元素；
           · 只在 caption **是 None** 时写 ""，绝不覆盖已有描述；
-          · PIR 接管图片 / 原生多模态模式下一律不碰（与 stage1 的跳过条件一致）；
           · 本模块整体关闭（section_media_recognition.enabled=false）时不做，
             这种配置下"框架自己识图"本来就是期望行为。
+
+        PIR/native 放行分支（v2.3.3 收口）：即使 PIR 接管图片 / 原生多模态直传，也照占
+        caption="" 再返回 —— PIR"已加载但 handler 未摘除"的竞态窗口里若放行留 None，
+        框架渲染就会 F1 付费识图。占 "" 无害：native 模式框架渲染会把 caption 覆写为
+        "attached image"；PIR 活着会自己填描述；僵尸 PIR 留 "" 恰好堵住框架 F1。
 
         返回值 = 占位的媒体个数（供测试/日志用）。
         """
@@ -357,9 +424,9 @@ class ParallelMediaRecognizer:
             return 0
         try:
             sid = getattr(getattr(event, "session", None), "sid", None)
-            # 与 stage1 保持同一套"谁负责图片"的判定：PIR 接管 / native 直传时不插手
-            if self._pir_active() or self._native_mode(sid):
-                return 0
+            # PIR 接管 / native 直传时仍占位（见 docstring）：这里只占位防 F1，
+            # 其余处理（暂存/识别）仍由 stage1 的跳过逻辑分流
+            self._pir_active()   # 顺带触发 PIR 自动互斥检测（保持原有时机）
             n = 0
             for elem in self._iter_media_elems(getattr(getattr(event, "message", None), "chain", None)):
                 try:
@@ -394,12 +461,41 @@ class ParallelMediaRecognizer:
             self._flatten_forwards(event.message.chain)
             media: dict[str, dict] = {}
             _sid = getattr(getattr(event, "session", None), "sid", None)
-            await self._walk_chain(
-                event.message.chain, media, set(),
-                is_mentioned=bool(getattr(event, "is_mentioned", False)),
-                sid=_sid,
-            )
+            targets: list = []
+            self._collect_media_targets(event.message.chain, targets, set(), sid=_sid)
+            if targets:
+                # 并行预填充（限流 4）：原实现逐元素串行 await（URL 下载算 hash + DB 查询
+                # + 语音 to_base64），一条 k 图消息的 flush 被推迟 k×(下载+DB)；
+                # 先收集再 gather，媒体预填充不再卡在首 token 关键路径上
+                sem = asyncio.Semaphore(4)
+
+                async def _prefill_one(t):
+                    kind, elem, mtype, ch, idx = t
+                    async with sem:
+                        if kind == "prefill":
+                            await self._prefill_media(elem, mtype, media)
+                        else:
+                            replaced = await self._replace_media(elem, "Record", media)
+                            if replaced is not None:
+                                ch[idx] = replaced
+
+                await asyncio.gather(*[_prefill_one(t) for t in targets],
+                                     return_exceptions=True)
             if media:
+                # URL 失效重取注册表：记录 media_id → (message_id, adapter_name)，
+                # 下载失败时凭 message_id 经适配器 get_msg 拿新鲜 URL（见 _refresh_media_url）
+                try:
+                    _msg_id = getattr(event.message, "message_id", None)
+                    _ainfo = getattr(event, "adapter", None)
+                    _aname = getattr(_ainfo, "name", None) or getattr(_ainfo, "adapter_id", None)
+                    if _msg_id:
+                        if len(self._media_source) > 2048:
+                            for _k in list(self._media_source)[: len(self._media_source) - 1024]:
+                                self._media_source.pop(_k, None)
+                        for _k in media:
+                            self._media_source[_k] = (str(_msg_id), _aname)
+                except Exception:
+                    pass
                 # 合并而非覆盖：并行识图插件（PIR）可能已先写入 Image 索引，
                 # 直接覆盖会让它 stage2/stage3 拿不到图片（图片标识符永远空）
                 existing = getattr(event.message, self._media_attr, None) or {}
@@ -412,6 +508,11 @@ class ParallelMediaRecognizer:
                 if _sid:
                     bucket = self._round_media.setdefault(_sid, {})
                     bucket.update(media)
+                    # 桶内限长：每 sid 最多 64 条（批次被 stop 到不了 llm_request 清理点时
+                    # 桶会持续增长），超出按插入顺序淘汰最旧
+                    if len(bucket) > 64:
+                        for _k in list(bucket)[: len(bucket) - 64]:
+                            bucket.pop(_k, None)
                     # 有界清理（与 stage2 同范式）：最多保留 128 个 sid 的索引
                     if len(self._round_media) > 128:
                         for old_sid in list(self._round_media)[: len(self._round_media) - 64]:
@@ -432,9 +533,14 @@ class ParallelMediaRecognizer:
         except Exception:
             logger.exception("stage1 error")
 
-    async def _walk_chain(self, chain, media: dict, visited: set, is_mentioned: bool = False,
-                          sid: Optional[str] = None):
-        """递归遍历 chain（含 Reply.chain / Forward.chains，带环检测）。嵌套 Forward 已拍平。"""
+    def _collect_media_targets(self, chain, targets: list, visited: set,
+                               sid: Optional[str] = None):
+        """递归收集待处理媒体（**同步、纯遍历**，不下载不查库；嵌套 Forward 已拍平）。
+
+        收集为 (kind, elem, mtype, chain, idx) 五元组，由调用方 gather 并行处理
+        （v2.3.3 起替代串行的 _walk_chain，消除 ON_IM_MESSAGE 关键路径上的串行
+        下载/DB 等待）。kind ∈ {"prefill"（图片/表情）, "record"（语音，需回填替换）}。
+        """
         if chain is None:
             return
         cid = id(chain)
@@ -455,16 +561,35 @@ class ParallelMediaRecognizer:
                 if self._native_mode(sid):
                     continue
                 mtype = "Image" if isinstance(elem, Image) else "Sticker"
-                await self._prefill_media(elem, mtype, media)
+                targets.append(("prefill", elem, mtype, chain, idx))
             elif isinstance(elem, Record):
-                replaced = await self._replace_media(elem, "Record", media)
-                if replaced is not None:
-                    chain[idx] = replaced
+                targets.append(("record", elem, "Record", chain, idx))
             elif isinstance(elem, Reply):
-                await self._walk_chain(getattr(elem, "chain", None), media, visited, is_mentioned, sid)
+                self._collect_media_targets(getattr(elem, "chain", None), targets, visited, sid)
             elif isinstance(elem, Forward):
                 for sub in (getattr(elem, "chains", None) or []):
-                    await self._walk_chain(sub, media, visited, is_mentioned, sid)
+                    self._collect_media_targets(sub, targets, visited, sid)
+
+    async def _elem_md5(self, elem) -> Optional[str]:
+        """元素 md5：path 型文件用 asyncio.to_thread 读盘计算（避开框架 hash_image 在
+        事件循环里同步 open().read() 全文件堵首 token）；url/base64 型走框架 hash_image。"""
+        try:
+            cached = getattr(elem, "md5", None)
+            if cached:
+                return cached
+            if getattr(elem, "file_type", "") == "path" and getattr(elem, "file", None):
+                def _hash_path():
+                    with open(elem.file, "rb") as f:
+                        return hashlib.md5(f.read()).hexdigest()
+                md5 = await asyncio.to_thread(_hash_path)
+                try:
+                    elem.md5 = md5
+                except Exception:
+                    pass
+                return md5
+            return await elem.hash_image()
+        except Exception:
+            return None
 
     async def _prefill_media(self, elem, mtype: str, media: dict):
         """图片/表情包 → 预置 caption（元素保留，不替换、不删除）。
@@ -482,10 +607,7 @@ class ParallelMediaRecognizer:
         if getattr(elem, "_media_skip", False):
             elem.caption = ""  # 官方空占位 + 阻止框架自动 VLM（caption 非 None）
             return
-        try:
-            md5 = await elem.hash_image()
-        except Exception:
-            md5 = None
+        md5 = await self._elem_md5(elem)
         short_id = md5[:8] if md5 else f"noid_{id(elem)}"
         # 把本阶段使用的键钉在元素上：框架 handle_im_batch_message 会在渲染前调用
         # compress_image_element()（media.md5 = None + 换文件），随后 message_format_to_text
@@ -493,6 +615,13 @@ class ParallelMediaRecognizer:
         # elem.md5 反推键，就会查不到 results → 识别结果无法合并（VLM 白跑、LLM 看不见图）。
         try:
             elem._pir_short_id = short_id
+        except Exception:
+            pass
+        # 到达即落盘：url 型媒体此刻就把字节持久化到插件自有缓存目录并设置
+        # elem._temp_path —— 之后识别/渲染/read_file 全链吃本地字节，URL 过期免疫；
+        # 缓存命中的图同样落盘（框架渲染 to_path 也受益）。失败静默降级，不阻塞流程
+        try:
+            await self._persist_media(elem, md5)
         except Exception:
             pass
         if md5:
@@ -531,6 +660,11 @@ class ParallelMediaRecognizer:
             elem._pir_short_id = short_id  # 同 _prefill_media：把键钉在元素上
         except Exception:
             pass
+        # 到达即落盘（同 _prefill_media）：url 型语音持久化到插件自有缓存目录
+        try:
+            await self._persist_media(elem, md5)
+        except Exception:
+            pass
         media[short_id] = {"md5": md5, "elem": elem, "type": mtype, "_done": bool(desc)}
         if desc:
             # 缓存命中：直接带 file_path（to_path 幂等，_temp_path 已缓存不重复下载）
@@ -558,6 +692,24 @@ class ParallelMediaRecognizer:
                 return str(path)
         except Exception:
             return None
+
+    async def _batch_media_paths(self, elems) -> dict:
+        """并行预取媒体本地路径（to_path 落盘，限流 4）：stage3 抢救/批量探测用。
+
+        返回 {id(elem): path or None}。原实现在循环里逐个串行 await _media_path()
+        （url 型每次都要下载），多张图时明显拖慢 LLM 首 token。
+        """
+        out: dict[int, Optional[str]] = {}
+        if not elems:
+            return out
+        sem = asyncio.Semaphore(4)
+
+        async def _probe_one(e):
+            async with sem:
+                out[id(e)] = await self._media_path(e)
+
+        await asyncio.gather(*[_probe_one(e) for e in elems], return_exceptions=True)
+        return out
 
     async def _record_md5(self, elem) -> Optional[str]:
         """音频指纹：to_base64 后取 md5（Record 无 hash_image）。"""
@@ -591,6 +743,11 @@ class ParallelMediaRecognizer:
             for _, media in tasks:
                 for short_id, info in media.items():
                     self._round_media[sess_sid][short_id] = info
+            # 桶内限长：每 sid 最多 64 条，超出按插入顺序淘汰最旧
+            _rm_bucket = self._round_media[sess_sid]
+            if len(_rm_bucket) > 64:
+                for _k in list(_rm_bucket)[: len(_rm_bucket) - 64]:
+                    _rm_bucket.pop(_k, None)
             # 防无界增长：最多保留 128 个 sid 的索引，超出清最旧
             if len(self._round_media) > 128:
                 for old_sid in list(self._round_media)[: len(self._round_media) - 64]:
@@ -628,6 +785,9 @@ class ParallelMediaRecognizer:
                 for short_id, info in media.items():
                     # 创建 coro 前就设 _done=True：防并发 stage2 重复建 coro
                     info["_done"] = True
+                    # 进入关键路径：摘掉预取标记（改占会话/全局信号量），日志来源标 stage2
+                    info.pop("_prefetch", None)
+                    info["_mr_source"] = "stage2"
                     if info["type"] in ("Image", "Sticker"):
                         coros.append(self._describe_one(sess_sid, short_id, info, results, batch_sem=batch_img_sem))
                     else:
@@ -791,7 +951,10 @@ class ParallelMediaRecognizer:
         if not msgs:
             return
         try:
-            asyncio.create_task(self._prefetch_worker(sid, msgs, reason))
+            # 裸 create_task 持强引用（_bg_tasks），防 GC 在任务完成前回收导致静默中断
+            task = asyncio.create_task(self._prefetch_worker(sid, msgs, reason))
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
         except Exception as e:
             logger.debug(f"prefetch schedule failed: {type(e).__name__}: {e}")
 
@@ -819,13 +982,15 @@ class ParallelMediaRecognizer:
             if len(pool) > 512:
                 for old in list(pool)[: len(pool) - 256]:
                     pool.pop(old, None)
-            batch_img_sem = asyncio.Semaphore(max(1, self.max_parallel_images))
-            batch_aud_sem = asyncio.Semaphore(max(1, self.max_parallel_audios))
+            batch_img_sem = None   # 预取走独立信号量（_prefetch_sem），不占批次/会话/全局槽
+            batch_aud_sem = None
             started = 0
             for media_id, info in media.items():
                 if self._has_desc(sid, media_id) or media_id in self._pf_tasks:
                     continue          # 已有描述 → 不重复；正在飞 → 去重（失败后允许再试）
                 info["_done"] = True
+                info["_prefetch"] = True        # 预取标记：_describe_one/_transcribe_one 据此
+                info["_mr_source"] = "prefetch"  # 走独立信号量 + 先落盘 + 日志来源前缀
                 if info["type"] in ("Image", "Sticker"):
                     coro = self._describe_one(sid, media_id, info, pool, batch_sem=batch_img_sem)
                 else:
@@ -864,20 +1029,37 @@ class ParallelMediaRecognizer:
     async def _describe_one(self, sess_sid: str, media_id: str, info: dict, results: dict,
                             batch_sem: Optional[asyncio.Semaphore] = None):
         md5 = info["md5"]
+        source = str(info.get("_mr_source") or "stage2")
         cached = await self._cache_get(md5) if md5 else None
         if cached:
             info["_done"] = True
             results[media_id] = cached
             return
         try:
-            sess_sem = self._session_sem(self._session_img_sems, sess_sid, self.vlm_max_parallel_per_session)
-            # 三层限流：批次级 → 会话级 → 全局级（固定获取顺序，无死锁）
-            if batch_sem is not None:
-                async with batch_sem, sess_sem, self._global_img_sem:
-                    desc = await asyncio.wait_for(self._describe_image(info["elem"], sess_sid), self.media_timeout)
+            if info.get("_prefetch"):
+                # 预取并发隔离：先落盘（URL 失效免疫，识别直接吃本地字节），识别只占
+                # 预取专用信号量 —— 不占用 stage2/stage3 关键路径的会话级/全局级信号量
+                try:
+                    await self._persist_media(info.get("elem"), md5)
+                except Exception:
+                    pass
+                async with self._prefetch_sem:
+                    desc = await asyncio.wait_for(
+                        self._describe_image(info["elem"], sess_sid, media_id=media_id,
+                                             source=source), self.media_timeout)
             else:
-                async with sess_sem, self._global_img_sem:
-                    desc = await asyncio.wait_for(self._describe_image(info["elem"], sess_sid), self.media_timeout)
+                sess_sem = self._session_sem(self._session_img_sems, sess_sid, self.vlm_max_parallel_per_session)
+                # 三层限流：批次级 → 会话级 → 全局级（固定获取顺序，无死锁）
+                if batch_sem is not None:
+                    async with batch_sem, sess_sem, self._global_img_sem:
+                        desc = await asyncio.wait_for(
+                            self._describe_image(info["elem"], sess_sid, media_id=media_id,
+                                                 source=source), self.media_timeout)
+                else:
+                    async with sess_sem, self._global_img_sem:
+                        desc = await asyncio.wait_for(
+                            self._describe_image(info["elem"], sess_sid, media_id=media_id,
+                                                 source=source), self.media_timeout)
             # 无论成功失败都标记已处理：同一条消息重发不再重复识别（防 429 风暴）
             info["_done"] = True
             if desc and self._is_valid_desc(desc):
@@ -886,17 +1068,26 @@ class ParallelMediaRecognizer:
                 # 记下 dHash：同图被第三方插件重新下载/重压缩成另一字节流时，仍能命中描述
                 await self._phash_remember(info.get("elem"), desc)
                 results[media_id] = desc
+            elif desc in _PLACEHOLDER_DESCS:
+                # 分类占位（(下载失败) 等）：占住结果池防重试/防空占位进 LLM，
+                # 但不进持久缓存（_is_valid_desc 已拒绝）
+                results[media_id] = desc
             else:
-                logger.warning(f"image VLM returned empty/invalid desc id={media_id} md5={md5[:8] if md5 else 'n/a'}")
+                logger.warning(f"[MediaRecognize:{source}] image VLM returned empty/invalid desc id={media_id} md5={md5[:8] if md5 else 'n/a'}")
                 results[media_id] = "(未识别)"
+        except asyncio.TimeoutError:
+            info["_done"] = True
+            logger.warning(f"[MediaRecognize:{source}] image describe timeout id={media_id}（>{self.media_timeout:.0f}s）")
+            results[media_id] = "(识别超时)"
         except Exception as e:
             info["_done"] = True
-            logger.warning(f"image describe failed id={media_id}: {type(e).__name__}: {e}")
+            logger.warning(f"[MediaRecognize:{source}] image describe failed id={media_id}: {type(e).__name__}: {e}")
             results[media_id] = "(未识别)"
 
     async def _transcribe_one(self, sess_sid: str, media_id: str, info: dict, results: dict,
                               batch_sem: Optional[asyncio.Semaphore] = None):
         md5 = info["md5"]
+        source = str(info.get("_mr_source") or "stage2")
         cached = await self._cache_get(md5) if md5 else None
         if cached:
             info["_done"] = True
@@ -907,19 +1098,29 @@ class ParallelMediaRecognizer:
             stt_client = provider_mgr.get_default_stt() if provider_mgr is not None else None
             if stt_client is None:
                 info["_done"] = True
-                logger.warning(f"STT client unavailable (no default STT model) id={media_id}")
+                logger.warning(f"[MediaRecognize:{source}] STT client unavailable (no default STT model) id={media_id}")
                 results[media_id] = "(未识别)"
                 return
-            sess_sem = self._session_sem(self._session_aud_sems, sess_sid, self.stt_max_parallel_per_session)
-            # 三层限流：批次级 → 会话级 → 全局级（固定获取顺序，无死锁）
-            if batch_sem is not None:
-                async with batch_sem, sess_sem, self._global_aud_sem:
+            if info.get("_prefetch"):
+                # 预取并发隔离（与 _describe_one 同理）：先落盘 + 只占预取专用信号量
+                try:
+                    await self._persist_media(info.get("elem"), md5)
+                except Exception:
+                    pass
+                async with self._prefetch_sem:
                     text = await asyncio.wait_for(
                         speech_to_text(client=stt_client, record=info["elem"]), self.media_timeout)
             else:
-                async with sess_sem, self._global_aud_sem:
-                    text = await asyncio.wait_for(
-                        speech_to_text(client=stt_client, record=info["elem"]), self.media_timeout)
+                sess_sem = self._session_sem(self._session_aud_sems, sess_sid, self.stt_max_parallel_per_session)
+                # 三层限流：批次级 → 会话级 → 全局级（固定获取顺序，无死锁）
+                if batch_sem is not None:
+                    async with batch_sem, sess_sem, self._global_aud_sem:
+                        text = await asyncio.wait_for(
+                            speech_to_text(client=stt_client, record=info["elem"]), self.media_timeout)
+                else:
+                    async with sess_sem, self._global_aud_sem:
+                        text = await asyncio.wait_for(
+                            speech_to_text(client=stt_client, record=info["elem"]), self.media_timeout)
             # 无论成功失败都标记已处理：同一条消息重发不再重复识别（防 429 风暴）
             info["_done"] = True
             if text and self._is_valid_desc(text):
@@ -927,57 +1128,62 @@ class ParallelMediaRecognizer:
                     await self._cache_set(md5, text)
                 results[media_id] = text
             else:
-                logger.warning(f"STT returned empty/invalid text id={media_id}")
+                logger.warning(f"[MediaRecognize:{source}] STT returned empty/invalid text id={media_id}")
                 results[media_id] = "(未识别)"
+        except asyncio.TimeoutError:
+            info["_done"] = True
+            logger.warning(f"[MediaRecognize:{source}] STT timeout id={media_id}（>{self.media_timeout:.0f}s）")
+            results[media_id] = "(识别超时)"
         except Exception as e:
             info["_done"] = True
-            logger.warning(f"STT failed id={media_id}: {type(e).__name__}: {e}")
+            logger.warning(f"[MediaRecognize:{source}] STT failed id={media_id}: {type(e).__name__}: {e}")
             results[media_id] = "(未识别)"
 
-    async def _describe_image(self, elem, sid: Optional[str] = None) -> str:
-        """图片 VLM：统一 to_data_url → vlm.chat 路径（对齐并行识图插件已验证路径）；
-        to_data_url 失败时 fallback 直接 httpx 下载（带 UA + pixiv Referer，覆盖图床防盗链）；
-        quality_enabled 时 JPEG 压缩。失败返回 ""（调用方降级为 (未识别) 并打日志）。"""
+    async def _describe_image(self, elem, sid: Optional[str] = None,
+                              media_id: Optional[str] = None, source: str = "stage2") -> str:
+        """图片 VLM（三段式）：
+        (a) **本地字节优先**：已落盘（_temp_path / path 型 file）则直接读盘，不走 URL；
+        (b) 无本地字节才走 URL 下载，下载单独吃 download_timeout（与 VLM 预算分离），
+            失败时凭 message_id 经适配器 get_msg 重取新 URL 重试一次，仍失败返回 "(下载失败)"；
+        (c) VLM 推理由外层 wait_for(media_timeout) 兜底（超时由调用方归类为 (识别超时)）。
+        quality_enabled 时 JPEG 压缩（to_thread，不堵事件循环）。
+        其它异常返回 ""（调用方降级为 (未识别) 并打日志）。"""
         try:
             vlm = self.ctx.provider_mgr.get_default_vlm()
             if vlm is None:
-                logger.warning("get_default_vlm() returned None")
+                logger.warning(f"[MediaRecognize:{source}] get_default_vlm() returned None")
                 return ""
             # 可观测性：框架的 desc_img() 会打 "Describing image using …"，而我们直接
             # vlm.chat()（绕过了那层包装）→ 成功时不打任何日志，日志里无法分辨一次识图
-            # 是本插件发起还是框架自己发起的。这里补一条**与官方同款文案 + 同款紫色**的
-            # 日志（本模块 logger 名为 "MediaRecognize"、颜色 purple，故前缀即
-            # [MediaRecognize]），便于对照排查（谁在识图、用的是哪个模型）。
+            # 是本插件发起还是框架自己发起的。这里补一条与官方同款文案 + 来源前缀的
+            # 日志（[MediaRecognize:prefetch|stage2|stage3]），便于对照排查谁在识图。
             try:
                 _mdl = vlm.model
                 logger.info(
-                    f"Describing image using {_mdl.model_id} ({_mdl.provider_name})"
+                    f"[MediaRecognize:{source}] Describing image using {_mdl.model_id} ({_mdl.provider_name})"
                 )
             except Exception:
                 pass
             data_url = None
-            try:
-                data_url = await elem.to_data_url()
-            except Exception as e:
-                logger.debug(f"to_data_url failed ({type(e).__name__}), try direct download")
-                data_url = await self._try_direct_download(elem)
-            if not data_url:
-                logger.warning(
-                    f"cannot fetch image data: "
-                    f"file_type={getattr(elem, 'file_type', '?')} "
-                    f"file={str(getattr(elem, 'file', ''))[:80]}"
-                )
-                return ""
+            # (a) 本地字节优先
+            local = getattr(elem, "_temp_path", None)
+            if not local and getattr(elem, "file_type", "") == "path":
+                local = getattr(elem, "file", None)
+            data = await self._read_media_bytes(local) if local else None
+            if data:
+                mime = getattr(elem, "mime", None) or "image/jpeg"
+                data_url = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+            else:
+                # (b) URL 下载（独立短超时 + 失效重取一次）
+                data_url = await self._fetch_image_data(elem, media_id, source)
+                if data_url is None:
+                    return "(下载失败)"
             if self.quality_enabled:
-                _, _, b64 = data_url.partition(",")
-                if not b64:
-                    logger.warning("empty base64 after to_data_url")
+                data_url = await asyncio.to_thread(
+                    _reencode_jpeg, data_url, max(10, min(100, self.quality_value)))
+                if not data_url:
+                    logger.warning(f"[MediaRecognize:{source}] empty base64 after re-encode")
                     return ""
-                img = _open_image(base64.b64decode(b64))
-                q = max(10, min(100, self.quality_value))
-                buf = BytesIO()
-                img.save(buf, format="JPEG", quality=q)
-                data_url = f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
             prompt = self._vlm_prompt(sid)
             request = LLMRequest(messages=[{
                 "role": "user",
@@ -989,8 +1195,114 @@ class ParallelMediaRecognizer:
             resp = await vlm.chat(request)
             return (resp.text_response or "").strip() if resp else ""
         except Exception as e:
-            logger.warning(f"describe image failed: {type(e).__name__}: {e}")
+            logger.warning(f"[MediaRecognize:{source}] describe image failed: {type(e).__name__}: {e}")
             return ""
+
+    async def _fetch_image_data(self, elem, media_id: Optional[str] = None,
+                                source: str = "stage2") -> Optional[str]:
+        """URL 下载（独立 download_timeout）：to_data_url → 直接 httpx 下载（带 UA +
+        pixiv Referer）→ URL 失效重取（get_msg 新 URL）后重试一次。全失败返回 None。"""
+        last_err: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                return await asyncio.wait_for(elem.to_data_url(), timeout=self.download_timeout)
+            except Exception as e:
+                last_err = e
+                logger.debug(f"[MediaRecognize:{source}] to_data_url failed ({type(e).__name__}), try direct download")
+                data_url = await self._try_direct_download(elem)
+                if data_url:
+                    return data_url
+                # URL 失效重取：凭 stage1 登记的 message_id 经适配器 get_msg 拿新鲜 URL，
+                # 更新 elem.file 后重试一次；能力不存在（非 napcat/无该方法）静默跳过
+                if attempt == 0 and await self._refresh_media_url(elem, media_id):
+                    logger.info(f"[MediaRecognize:{source}] URL 已失效，经 get_msg 重取新 URL 后重试")
+                    continue
+                break
+        logger.warning(
+            f"[MediaRecognize:{source}] image download failed: "
+            f"{type(last_err).__name__ if last_err else '?'}: {last_err} "
+            f"file_type={getattr(elem, 'file_type', '?')} file={str(getattr(elem, 'file', ''))[:80]}"
+        )
+        return None
+
+    async def _refresh_media_url(self, elem, media_id: Optional[str] = None) -> bool:
+        """URL 失效重取：凭注册表里的 message_id 经适配器客户端 get_msg 拿新鲜 URL。
+
+        napcat 的 get_msg 会返回带新 rkey 的图片/语音 URL（KSM history_tool 已验证）。
+        能力不存在（非 napcat / 无 get_msg 方法 / 注册表无记录）时静默返回 False。
+        成功时更新 elem.file（Image 同步 elem.image）并清 _temp_path 强制重下。全程兜底。
+        """
+        try:
+            src = self._media_source.get(media_id) if media_id else None
+            if not src:
+                return False
+            message_id, adapter_name = src
+            if not message_id:
+                return False
+            am = getattr(self.ctx, "adapter_mgr", None)
+            if am is None:
+                return False
+            adapter = None
+            if adapter_name:
+                try:
+                    adapter = am.get_adapter(adapter_name)
+                except Exception:
+                    adapter = None
+            if adapter is None:
+                # 注册表没带适配器名：单适配器场景兜底取第一个
+                try:
+                    adapters = getattr(am, "adapters", None) or {}
+                    adapter = next(iter(adapters.values()), None)
+                except Exception:
+                    adapter = None
+            client = None
+            if adapter is not None and hasattr(adapter, "get_client"):
+                try:
+                    client = adapter.get_client()
+                except Exception:
+                    client = None
+            if client is None or not hasattr(client, "get_msg"):
+                return False
+            resp = await client.get_msg(message_id)
+            data = (resp or {}).get("data") or {}
+            url = self._extract_media_url(data, elem)
+            if not url:
+                return False
+            try:
+                elem.file = url
+            except Exception:
+                pass
+            try:
+                if hasattr(elem, "image"):
+                    elem.image = url
+            except Exception:
+                pass
+            try:
+                elem._temp_path = None   # 清掉旧本地指针，强制用新 URL 重下
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _extract_media_url(data: dict, elem) -> Optional[str]:
+        """从 get_msg 返回的消息段里取与元素类型匹配的媒体新 URL（best-effort）。"""
+        try:
+            segs = data.get("message") or []
+            if isinstance(segs, str):
+                return None            # CQ 码字符串形态无从可靠解析，放弃
+            want = "record" if elem.__class__.__name__ == "Record" else "image"
+            for seg in segs:
+                if not isinstance(seg, dict) or seg.get("type") != want:
+                    continue
+                d = seg.get("data") or {}
+                url = d.get("url") or d.get("file")
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    return url
+        except Exception:
+            pass
+        return None
 
     def _vlm_prompt(self, sid: Optional[str] = None) -> str:
         """VLM 描述词：跟随 WebUI 配置 image_recognition.desc_prompt（对齐框架
@@ -1015,7 +1327,8 @@ class ParallelMediaRecognizer:
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                               "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
             }
-            async with httpx.AsyncClient(follow_redirects=True, timeout=self.media_timeout) as client:
+            # 下载吃独立的 download_timeout（与 VLM 推理预算分离）
+            async with httpx.AsyncClient(follow_redirects=True, timeout=self.download_timeout) as client:
                 resp = await client.get(url, headers=headers)
                 if resp.status_code != 200:
                     # pixiv 图床防盗链：补 Referer 重试
@@ -1071,6 +1384,7 @@ class ParallelMediaRecognizer:
             # 它们命中 → 会把不在请求里的媒体也送去 VLM（识别了不该识别的对象，并把该媒体
             # 的描述/路径填进了别的媒体的空占位）。
             _batch_ids = self._batch_media_ids(event)
+            _cands1: list = []   # (mid, info, elem, mtype)
             for mid, info in list(round_media.items()):
                 if mid in need or not isinstance(info, dict):
                     continue
@@ -1087,28 +1401,29 @@ class ParallelMediaRecognizer:
                 else:
                     try:
                         _cap = (getattr(elem, "caption", None) or "").strip()
-                        if _cap and _cap != "(未识别)":
-                            continue            # 已有真描述才跳过；(未识别) 允许再试一次
+                        # 已有真描述才跳过；失败占位（(未识别)/(识别超时)/(下载失败) 等）
+                        # 允许再试一次
+                        if _cap and self._is_valid_desc(_cap):
+                            continue
                     except Exception:
                         continue
-                anchor = _anchor_of(elem, mtype, await self._media_path(elem), mid)
-                if anchor and any(anchor in t for t in _texts):
-                    official[mid] = (elem, mtype)
-                    need[mid] = anchor
+                _cands1.append((mid, info, elem, mtype))
 
             # ② 直接扫描本批次消息链：捕获「我方完全没认领（caption is None / ""）
             #    但请求里仍是空占位」的媒体——例如消息在 ON_IM_MESSAGE 阶段被其它插件
             #    stop 掉，我方 stage1 从未执行；或批次被第三方拦截后消息才进入请求。
             #    这是最后一道保险：凡是请求里出现空占位、而我们又确实拿到了原元素，
             #    就在这里补齐描述，绝不让空占位进 LLM。
+            _cands2: list = []   # (_elem, mtype)
             if not self._pir_active() and not self._native_mode(event.sid):
                 for _m in (getattr(event, "messages", None) or []):
                     for _elem in self._iter_media_elems(getattr(_m, "chain", None)):
                         if not isinstance(_elem, (Image, Sticker)):
                             continue
                         _cap = str(getattr(_elem, "caption", None) or "").strip()
-                        if _cap and _cap != "(未识别)":
-                            continue            # 已有真描述才跳过；(未识别) 允许再试一次
+                        # 同 ①：已有真描述才跳过；失败占位允许再试一次
+                        if _cap and self._is_valid_desc(_cap):
+                            continue
                         # PIR 的跳过标记：一律尊重（并行识图插件的分工）
                         if getattr(_elem, "_pir_skip", False):
                             continue
@@ -1122,26 +1437,43 @@ class ParallelMediaRecognizer:
                         if getattr(_elem, "_media_skip", False):
                             continue
                         mtype = "Sticker" if isinstance(_elem, Sticker) else "Image"
-                        anchor = _anchor_of(_elem, mtype, await self._media_path(_elem))
-                        if not any(anchor in t for t in _texts):
-                            continue
-                        _md5 = None
-                        try:
-                            _md5 = await _elem.hash_image()
-                        except Exception:
-                            _md5 = None
-                        mid = _md5[:8] if _md5 else f"noid_{id(_elem)}"
-                        if mid in need:
-                            continue
-                        round_media.setdefault(mid, {
-                            "md5": _md5, "elem": _elem, "type": mtype, "_done": False,
-                        })
-                        try:
-                            _elem._pir_short_id = mid
-                        except Exception:
-                            pass
-                        official[mid] = (_elem, mtype)
-                        need[mid] = anchor
+                        _cands2.append((_elem, mtype))
+
+            # 并行预取候选媒体的本地路径（to_path 落盘，限流 4）——原实现循环内逐个
+            # 串行 await 下载，多张图时 stage3 抢救明显拖慢 LLM 首 token
+            _probe_elems = [c[2] for c in _cands1] + [c[0] for c in _cands2]
+            # 文本标识符兜底（历史 [Image #id: ] / [Record #id: ]）的elem也一并预取
+            for _mid in need:
+                _el = (round_media.get(_mid) or {}).get("elem") \
+                    if isinstance(round_media.get(_mid), dict) else None
+                if _el is not None and id(_el) not in {id(e) for e in _probe_elems}:
+                    _probe_elems.append(_el)
+            _probe_paths = await self._batch_media_paths(_probe_elems)
+
+            for mid, info, elem, mtype in _cands1:
+                anchor = _anchor_of(elem, mtype, _probe_paths.get(id(elem)), mid)
+                if anchor and any(anchor in t for t in _texts):
+                    official[mid] = (elem, mtype)
+                    need[mid] = anchor
+
+            for _elem, mtype in _cands2:
+                anchor = _anchor_of(_elem, mtype, _probe_paths.get(id(_elem)))
+                if not any(anchor in t for t in _texts):
+                    continue
+                # 锚点命中的才算 md5（url 型此处可能触发下载，未命中的候选不浪费流量）
+                _md5 = await self._elem_md5(_elem)
+                mid = _md5[:8] if _md5 else f"noid_{id(_elem)}"
+                if mid in need:
+                    continue
+                round_media.setdefault(mid, {
+                    "md5": _md5, "elem": _elem, "type": mtype, "_done": False,
+                })
+                try:
+                    _elem._pir_short_id = mid
+                except Exception:
+                    pass
+                official[mid] = (_elem, mtype)
+                need[mid] = anchor
             # ③ 文本级兜底：官方空占位按 file_path 的**内容哈希**补齐（零 VLM）。
             #    必须放在 `if not need: return` **之前**——今天的泄露正是这样溜走的：
             #    第三方插件（会话合并/上下文压缩）重建请求后链上已无元素，只剩文本里的
@@ -1178,6 +1510,9 @@ class ParallelMediaRecognizer:
                     # 有原媒体且未识别过 → 现场识别
                     # 注意：Sticker 与 Image 一样走 VLM 描述（与 stage2 的
                     # `type in ("Image","Sticker")` 判定保持一致），只有 Record 走 STT。
+                    # 进入关键路径：摘掉预取标记（改占会话/全局信号量），日志来源标 stage3
+                    info.pop("_prefetch", None)
+                    info["_mr_source"] = "stage3"
                     if info["type"] in ("Image", "Sticker"):
                         # 原生多模态模式：图片不识别，直接标 (未识别) 占位
                         if self._native_mode(event.sid):
@@ -1198,7 +1533,10 @@ class ParallelMediaRecognizer:
             for media_id in need:
                 info = round_media.get(media_id)
                 if info and info.get("elem") is not None:
-                    p = await self._media_path(info["elem"])
+                    # 优先复用并行预取阶段已探测的路径（避免二次下载），未探测的兜底现取
+                    p = _probe_paths.get(id(info["elem"]))
+                    if p is None:
+                        p = await self._media_path(info["elem"])
                     if p:
                         paths[media_id] = p
             for p in getattr(req, "user_prompt", []) or []:
@@ -1439,7 +1777,7 @@ class ParallelMediaRecognizer:
                 md5 = hashlib.md5(data).hexdigest()
                 desc = await self._cache_get(md5)
                 if not desc:
-                    ph = self._phash_of_bytes(data)
+                    ph = await asyncio.to_thread(self._phash_of_bytes, data)   # CPU 操作移出事件循环
                     desc = self._phash_nearest(ph)
                     if desc:
                         await self._cache_set(md5, desc)   # 顺手把新文件也登记进缓存
@@ -1460,15 +1798,36 @@ class ParallelMediaRecognizer:
     async def _cache_get(self, md5: str) -> Optional[str]:
         try:
             row = await self.ctx.db.get_image_desc_cache(md5)
-            return row["description"] if row else None
+            desc = row["description"] if row else None
+            # 占位污染免疫（双保险之读取侧）：框架渲染的失败分支会把 "(未识别)" 等占位
+            # 写进持久缓存（message_manager.py），读到一律视为未命中
+            if desc and not self._is_valid_desc(desc):
+                return None
+            return desc
         except Exception:
             return None
 
     async def _cache_set(self, md5: str, text: str):
+        """upsert 写缓存：存在即 update 刷新 last_seen，不存在才 add（带活时间）。
+
+        旧实现固定 add(count=1, last_seen=0) 有两个 bug：
+          ① last_seen=0 → 框架清理规则（last_seen < now-15天 且 count<2 即删，
+            core/db/service.py）次日必然删掉插件写入的全部缓存项；
+          ② add 遇主键冲突静默失败 → 同图重复写永远失败。
+        """
         if not md5 or not text:
             return
+        now = int(time.time())
+        updated = False
         try:
-            await self.ctx.db.add_image_desc_cache(md5, text, count=1, last_seen=0)
+            updated = bool(await self.ctx.db.update_image_desc_cache(
+                md5, description=text, last_seen=now))
+        except Exception:
+            updated = False
+        if updated:
+            return
+        try:
+            await self.ctx.db.add_image_desc_cache(md5, text, count=1, last_seen=now)
         except Exception:
             pass
 
@@ -1478,6 +1837,9 @@ class ParallelMediaRecognizer:
     def _is_valid_desc(desc: str) -> bool:
         if not desc or not desc.strip():
             return False
+        # 失败占位文案（框架/本模块的降级占位）不是有效描述：拒绝进缓存、不当命中
+        if desc.strip() in _PLACEHOLDER_DESCS:
+            return False
         if "\x00" in desc:
             return False
         if "<!--PIR:" in desc:
@@ -1486,7 +1848,351 @@ class ParallelMediaRecognizer:
             return False  # 防嵌套标识符注入缓存并扩散
         return True
 
+    # ================= 到达即落盘（插件自有媒体缓存） =================
+
+    @staticmethod
+    def _media_cache_dir() -> Path:
+        """插件自有媒体缓存目录（data/plugins_media_cache/）。
+
+        不用框架 data/temp：temp_monitor 的保护期只有 60s（core/temp_monitor.py），
+        在飞批次滞留超过 60s 时其中的图片文件会被误删 —— 自有目录不受其管辖。
+        """
+        try:
+            from core.utils.path_utils import get_data_path
+            return Path(get_data_path()) / "plugins_media_cache"
+        except Exception:
+            return Path("data") / "plugins_media_cache"
+
+    async def _persist_media(self, elem, md5: Optional[str] = None) -> Optional[str]:
+        """到达即落盘：url 型媒体字节持久化到插件自有缓存目录，并设置 elem._temp_path。
+
+        - 不改 elem.file/file_type：native 模式与框架渲染（compress/to_path）完全不受影响，
+          to_path() 命中 _temp_path 直接返回本地文件 → 识别/渲染/read_file 全链 URL 失效免疫；
+        - 文件名按内容 md5 命名：同图天然去重，重复命中只刷新 mtime（LRU）；
+        - 任何失败都静默降级（返回 None），不影响后续 URL 路径。
+        """
+        if not self.media_cache_enabled:
+            return None
+        try:
+            if getattr(elem, "file_type", "") != "url":
+                return None
+            old = getattr(elem, "_temp_path", None)
+            if old and os.path.exists(old):
+                return old
+            b64 = await asyncio.wait_for(elem.to_base64(), timeout=self.download_timeout)
+            if not b64:
+                return None
+            if b64.startswith("data:"):
+                b64 = b64.split(",", 1)[-1]
+            data = base64.b64decode(b64)
+            if not data:
+                return None
+            md5v = md5 or hashlib.md5(data).hexdigest()
+            ext = ""
+            try:
+                mime = (getattr(elem, "mime", None) or "").split(";")[0].strip()
+                if mime and "/" in mime:
+                    import mimetypes
+                    ext = mimetypes.guess_extension(mime) or ""
+            except Exception:
+                ext = ""
+            if not ext:
+                ext = ".jpg" if elem.__class__.__name__ in ("Image", "Sticker") else ".bin"
+            cache_dir = self._media_cache_dir()
+            path = cache_dir / f"{md5v}{ext}"
+
+            def _write():
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                if path.exists():
+                    os.utime(path, None)   # 同内容文件已存在：刷新 mtime（LRU 热度）
+                    return
+                tmp = cache_dir / f".{md5v}.{os.getpid()}.tmp"
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                os.replace(tmp, path)      # 原子落盘，防并发读半截文件
+
+            await asyncio.to_thread(_write)
+            try:
+                elem._temp_path = str(path)
+            except Exception:
+                pass
+            self._ensure_mc_cleanup()
+            return str(path)
+        except Exception:
+            return None
+
+    def _mc_protected_paths(self) -> set:
+        """在飞/待识别条目引用的缓存文件（对应批次还没进 LLM，绝不能删）。"""
+        out = set()
+        try:
+            for bucket in (self._round_media or {}).values():
+                for info in (bucket or {}).values():
+                    p = getattr((info or {}).get("elem"), "_temp_path", None)
+                    if p:
+                        out.add(str(p))
+            for info in (self._pf_infos or {}).values():
+                p = getattr((info or {}).get("elem"), "_temp_path", None)
+                if p:
+                    out.add(str(p))
+        except Exception:
+            pass
+        return out
+
+    def _ensure_mc_cleanup(self):
+        """懒启动媒体缓存清理后台任务（需要运行中的事件循环；terminate 时取消）。"""
+        if not self.media_cache_enabled:
+            return
+        t = self._mc_cleanup_task
+        if t is not None and not t.done():
+            return
+        try:
+            task = asyncio.create_task(self._mc_cleanup_loop())
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+            self._mc_cleanup_task = task
+        except Exception:
+            pass
+
+    async def _mc_cleanup_loop(self):
+        """媒体缓存治理：每 10 分钟扫一次（TTL 过期 + 总量 LRU），异常不炸任务。"""
+        try:
+            while True:
+                await asyncio.sleep(600)
+                try:
+                    # 受保护集合在事件循环侧先算好（遍历运行态字典），再进线程做磁盘扫描
+                    protected = self._mc_protected_paths()
+                    await asyncio.to_thread(self._mc_sweep_sync, protected)
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            return
+
+    def _mc_sweep_sync(self, protected: set):
+        """清理媒体缓存目录：TTL 过期删除；超总量上限按 mtime LRU 淘汰（线程内运行）。
+
+        保护规则：① 在飞/待识别条目引用的文件不删；② 宽限期（10 分钟）内的文件不删
+        —— 可能刚落盘还没进索引。
+        """
+        try:
+            d = self._media_cache_dir()
+            if not d.exists():
+                return
+            ttl = max(0.0, float(self.media_cache_ttl_hours)) * 3600
+            cap = max(1, int(self.media_cache_max_mb)) * 1024 * 1024
+            grace = 600.0
+            now = time.time()
+            entries = []
+            total = 0
+            for f in d.iterdir():
+                try:
+                    if not f.is_file() or f.name.startswith("."):
+                        continue
+                    st = f.stat()
+                except OSError:
+                    continue
+                entries.append((st.st_mtime, st.st_size, f))
+                total += st.st_size
+
+            def _removable(mtime, f):
+                return now - mtime > grace and str(f) not in protected
+
+            removed = 0
+            if ttl > 0:
+                for mtime, size, f in entries:
+                    if now - mtime > ttl and _removable(mtime, f):
+                        try:
+                            f.unlink()
+                            total -= size
+                            removed += 1
+                        except OSError:
+                            pass
+            if total > cap:
+                for mtime, size, f in sorted(entries):
+                    if total <= cap:
+                        break
+                    if not _removable(mtime, f):
+                        continue
+                    try:
+                        f.unlink()
+                        total -= size
+                        removed += 1
+                    except OSError:
+                        pass
+            if removed:
+                logger.info(f"[MediaRecognize] 媒体缓存清理：删除 {removed} 个文件"
+                            f"（剩余约 {total // 1024 // 1024}MB）")
+        except Exception:
+            pass
+
+    # ================= 生命周期（插件 initialize / terminate 调用） =================
+
+    def activate(self):
+        """插件 initialize 时调用：启用框架 desc_img 安全接管（幂等，可重复调用）。"""
+        try:
+            install_desc_img_guard(self)
+        except Exception as e:
+            logger.warning(f"[MediaRecognize] desc_img 接管启用失败（不影响本模块识别）: {type(e).__name__}: {e}")
+
+    async def shutdown(self):
+        """插件 terminate 时调用：还原 desc_img 接管、取消后台任务（清理/预取 worker）。幂等。"""
+        try:
+            uninstall_desc_img_guard()
+        except Exception:
+            pass
+        t = self._mc_cleanup_task
+        self._mc_cleanup_task = None
+        if t is not None and not t.done():
+            t.cancel()
+        for task in list(self._bg_tasks):
+            if not task.done():
+                task.cancel()
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+        self._bg_tasks.clear()
+
+    # ================= 描述索引查询（框架 desc_img 接管用） =================
+
+    async def _desc_index_lookup(self, image) -> Optional[str]:
+        """按 md5 → dHash 查本模块描述索引，命中返回描述（零 VLM）；未命中返回 None。
+
+        md5 取不到时读本地字节（_temp_path / path 型 file）现算；dHash 兜底覆盖
+        「同图不同字节」的副本（框架压缩后 md5 与 stage1 原图键分叉，靠画面指纹补救）。
+        """
+        if not self.enabled:
+            return None
+        data = None
+        md5 = getattr(image, "md5", None) or None
+        local = getattr(image, "_temp_path", None)
+        if not local and getattr(image, "file_type", "") == "path":
+            local = getattr(image, "file", None)
+        if not md5 and local:
+            data = await self._read_media_bytes(local)
+            if data:
+                md5 = hashlib.md5(data).hexdigest()
+        if md5:
+            desc = await self._cache_get(md5)   # 读取侧已过 _is_valid_desc
+            if desc:
+                return desc
+        if data is None and local:
+            data = await self._read_media_bytes(local)
+        if data:
+            ph = await asyncio.to_thread(self._phash_of_bytes, data)
+            desc = self._phash_nearest(ph)
+            if desc:
+                if md5:
+                    await self._cache_set(md5, desc)   # 顺手登记新键，下次 md5 直接命中
+                return desc
+        return None
+
 
 def _open_image(data: bytes):
     from PIL import Image as PILImage
     return PILImage.open(BytesIO(data)).convert("RGB")
+
+
+def _reencode_jpeg(data_url: str, quality: int) -> Optional[str]:
+    """JPEG 重编码（quality_enabled 时省 token/带宽）。
+
+    PIL 解码/编码是 CPU 操作：调用方必须用 asyncio.to_thread 移出事件循环。
+    失败返回 None（调用方按识别失败降级）。
+    """
+    try:
+        _, _, b64 = data_url.partition(",")
+        if not b64:
+            return None
+        img = _open_image(base64.b64decode(b64))
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        return f"data:image/jpeg;base64,{base64.b64encode(buf.getvalue()).decode()}"
+    except Exception:
+        return None
+
+
+# ================= 框架 desc_img 安全接管（插件侧 wrap，不改框架文件） =================
+#
+# 背景（详见 KiraAI插件全量排查与修复方案.md §1.2-G4 / §2.3）：
+# 框架的官方 VLM 有 4 个调用点，其中两处经 core.utils.common_utils.desc_img：
+#   F1 core/message_manager.py（批次渲染时 ele.caption is None）
+#   F2 core/plugin/builtin_plugins/agent/main.py（LLM 用 read_file 补读图片文件）
+# 这两处**无超时**（SDK 默认 600s×重试，单图最坏可卡住整个批次管线），且 F2 完全
+# 绕开本模块的三级限流 —— 插件识别失败后 LLM 循 file_path 补读 = 同图第二次付费。
+# 这里在插件 initialize 时对三个模块的 desc_img **属性引用**做幂等包装
+# （from-import 绑定的是模块属性，必须逐模块替换），terminate 时还原：
+#   (a) 先查本模块的 md5/dHash 描述索引，命中直接返回（零 VLM）；
+#   (b) 未命中调原函数并套 asyncio.wait_for(media_timeout)；
+#   (c) 异常/超时返回 ""（与原契约一致：调用方本就按 "" 降级）。
+_DESC_IMG_PATCHED: list = []   # [(module, original)]，还原用
+
+
+def install_desc_img_guard(recognizer) -> int:
+    """对框架三处 desc_img 引用做幂等包装（见上）。返回新包装的点数。
+
+    getattr 防御：任一模块/属性不存在就跳过该点；已被包装（含其它实例包装过）
+    则跳过（幂等防重入）。
+    """
+    import importlib
+    patched = 0
+    for modname in (
+        "core.message_manager",
+        "core.plugin.builtin_plugins.agent.main",
+        "core.utils.common_utils",
+    ):
+        try:
+            mod = importlib.import_module(modname)
+        except Exception:
+            continue                        # 模块不存在（精简部署）：跳过该点
+        orig = getattr(mod, "desc_img", None)
+        if orig is None or getattr(orig, "_kira_media_guard", False):
+            continue                        # 属性不存在 / 已被包装：幂等跳过
+        _orig = orig
+
+        async def _guarded_desc_img(*args, _orig=_orig, **kwargs):
+            image = kwargs.get("image")
+            if image is None and len(args) >= 2:
+                image = args[1]
+            # (a) 先查插件 md5/dHash 描述索引，命中直接返回（零 VLM）
+            try:
+                if image is not None:
+                    hit = await recognizer._desc_index_lookup(image)
+                    if hit:
+                        return hit
+            except Exception:
+                pass
+            # (b) 未命中调原函数并包 wait_for(media_timeout)；
+            # (c) 异常/超时返回 ""（与原契约一致：框架调用方本就按 "" 降级）
+            try:
+                return await asyncio.wait_for(_orig(*args, **kwargs), recognizer.media_timeout)
+            except Exception:
+                return ""
+
+        _guarded_desc_img._kira_media_guard = True   # 幂等标记
+        try:
+            setattr(mod, "desc_img", _guarded_desc_img)
+            _DESC_IMG_PATCHED.append((mod, _orig))
+            patched += 1
+        except Exception:
+            continue
+    if patched:
+        logger.info(
+            f"[MediaRecognize] 已接管框架 desc_img（{patched} 处引用：缓存命中零 VLM + "
+            f"wait_for({recognizer.media_timeout:.0f}s) 超时兜底，terminate 时还原）"
+        )
+    return patched
+
+
+def uninstall_desc_img_guard() -> int:
+    """还原所有 desc_img 包装（插件 terminate 调用）。返回还原的点数。"""
+    restored = 0
+    while _DESC_IMG_PATCHED:
+        mod, orig = _DESC_IMG_PATCHED.pop()
+        try:
+            # 只还原仍指向我们包装的引用（不覆盖框架/其它插件后来的改动）
+            cur = getattr(mod, "desc_img", None)
+            if getattr(cur, "_kira_media_guard", False):
+                setattr(mod, "desc_img", orig)
+                restored += 1
+        except Exception:
+            pass
+    if restored:
+        logger.info(f"[MediaRecognize] 已还原框架 desc_img（{restored} 处）")
+    return restored

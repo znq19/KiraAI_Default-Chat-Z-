@@ -1,4 +1,4 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.8.10
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.8.11
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
@@ -31,6 +31,58 @@
 
 <details>
 <summary>更新日志</summary>
+
+### v1.8.11
+
+- **VLM 泄露收口（多层堵漏）**
+  - **PIR/native guard 竞态占位**：官方 VLM 保护网（`guard_captions`）即使检测到 PIR 接管 /
+    原生多模态直传，也照占 `caption=""` 再返回 —— PIR「已加载但 handler 未摘除」的竞态窗口里
+    若放行留 `None`，框架渲染就会付费识图；`_pir_active()` 同步化（纯内存查注册表），消除旧版
+    异步判定的误判窗口。
+  - **缓存 last_seen upsert 修复**：`_cache_set` 改为先 `update_image_desc_cache(md5, description=…,
+    last_seen=now)`、未命中/失败才 `add` —— 旧实现固定 `add(last_seen=0)`：① `last_seen=0` 次日必被
+    框架清理规则删掉；② 主键冲突静默失败，同图重复写永远写不进。
+  - **占位污染免疫**：`_PLACEHOLDER_DESCS` 统一收口 "(未识别)/（已过期）/（识别超时）/（下载失败）"，
+    `_is_valid_desc` 拒绝进持久缓存，`_cache_get` 读取侧再过滤一遍（框架渲染失败分支写进库的
+    占位一律视为未命中）。
+  - **框架 desc_img 安全接管**：initialize 时对 `core.message_manager` /
+    `core.plugin.builtin_plugins.agent.main` / `core.utils.common_utils` 三处 `desc_img` 引用做
+    **幂等包装** —— 先查插件 md5/dHash 描述索引（命中零 VLM），未命中调原函数并套
+    `wait_for(media_timeout)`，异常/超时按原契约返回 `""`；terminate 时还原。**纯插件侧改动，
+    无需升级框架；包装是幂等的，插件卸载即还原，不改变 read_file 语义。**
+- **图片过期免疫**
+  - **到达即落盘**：url 型图片/语音在 stage1 即持久化到插件自有目录 `data/plugins_media_cache/`
+    并设置本地路径（不改 `file`/`file_type`，native 模式与框架渲染完全不受影响）——URL 过期后
+    识别/渲染/read_file 全链仍可用；自有目录不受框架 temp_monitor 60s 保护期误删影响。
+  - **URL 失效重取**：下载失败时凭 stage1 登记的 message_id 经适配器 `get_msg` 重取新 URL
+    （napcat 会刷新 rkey）重试一次，能力不存在时静默跳过。
+- **超时分拆与失败分类**：URL 下载吃独立的 `download_timeout`（默认 15s，新增配置项），
+  不再吃光整个 `media_timeout`；VLM 推理仍由外层 `wait_for(media_timeout)` 兜底。
+  失败分类返回 "（下载失败）/（识别超时）" 占位，日志来源统一 `[MediaRecognize:prefetch|stage2|stage3]`
+  前缀，下载慢与识别慢在日志里可区分。
+- **预取并发隔离**：预取走独立信号量 `vlm_prefetch_max_parallel`（默认 4，新增配置项），
+  不再占用 stage2/stage3 关键路径的会话级/全局级信号量（防预取风暴挤占兜底识别）。
+- **媒体缓存治理**：`media_cache_enabled`（默认开）/ `media_cache_ttl_hours`（默认 24h）/
+  `media_cache_max_mb`（默认 512MB，LRU 淘汰最旧）三个新增配置项；后台清理任务懒启动、
+  terminate 时取消；在飞/待识别条目引用的文件受保护不删（另有 10 分钟宽限期）。
+- **系统/通知消息不计入存在感与骚扰检测**：`system_*` sender（主动回复/定时任务/系统消息）
+  与无内容的通知事件不再压低存在感占比、不再误触骚扰通知、休眠期不再被其叫醒；
+  poke 戳一戳除外（真实用户互动，骚扰检测需要）。
+- **跨会话 ignore 竞态修复**：`<ignore>/<wake_extend>` tag 的会话上下文改为按 sid 精确匹配
+  （`_ignore_ctx` dict + `_RESP_SID` contextvar 透传当前响应所属会话 + 60s 过期清理）——
+  旧实现单一 `_last_ignore_sid` 标量，多会话并发回复时 A 会话的 `<ignore>` 可能错作用到 B
+  （跨会话错拉黑）。
+- **性能**：stage1 媒体预填充 gather 并行（原串行 await 下载+查库，k 张图推迟 flush k 倍）；
+  stage3 抢救并行化；path 型 md5 / PIL 重编码 / 语音读盘等 IO/CPU 操作全部移出事件循环
+  （`asyncio.to_thread`）。
+- **队列清场**：in-flight 已被 stop 且无 pending 的悬挂会话由兜底节拍立即清理推送，
+  不再白压会话状态多等一跳。
+- 裸 `create_task` 全部挂 `_bg_tasks` 强引用（防 GC 提前回收导致预取/清理任务静默中断）。
+- **回归测试** `tests/test_media_fixes.py`（19 断言，与 s 版同源）：T1 占位污染免疫、
+  T2 缓存 upsert 带活 last_seen（先 update 后 add 调用序）、T3 PIR 竞态窗口 guard 仍占位
+  `caption=""`。
+- 版本 v1.8.10 → v1.8.11（与 s 版 v2.5.20 同步；`media_recognize.py` / `queue_merge.py` /
+  `chat_enhance.py` 两版逐字节一致）
 
 ### v1.8.10
 
