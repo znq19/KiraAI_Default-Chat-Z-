@@ -773,6 +773,20 @@
         "minimum": 1,
         "hint": "排队/在飞空窗的后台预取走独立信号量，不占用 stage2/stage3 关键路径的会话级/全局级信号量（防预取风暴挤占兜底识别）"
       },
+      "vlm_prefetch_timeout": {
+        "name": "预取独立超时(秒)",
+        "type": "float",
+        "default": 30.0,
+        "minimum": 5.0,
+        "hint": "预取识别的独立超时（短于 media_timeout）：防超时项长时间占满预取槽位饿死后续预取；stage2/stage3 关键路径仍用完整 media_timeout"
+      },
+      "vlm_prefetch_max_queue": {
+        "name": "预取在途队列上限",
+        "type": "integer",
+        "default": 16,
+        "minimum": 1,
+        "hint": "在途预取任务数量上限，超限直接跳过新预取——被跳过的媒体仍由 stage2 正常识别，不会漏图"
+      },
       "media_cache_enabled": {
         "name": "到达即落盘（插件媒体缓存）",
         "type": "switch",
@@ -818,6 +832,13 @@
         "type": "boolean",
         "default": true,
         "hint": "避免触发原有 VLM 重复识别、浪费 token。默认开，如确有兼容需要可关闭。"
+      },
+      "guard_read_file_wait": {
+        "name": "read_file 拦截短等(秒)",
+        "type": "float",
+        "default": 8.0,
+        "minimum": 0.0,
+        "hint": "guard 拦截框架 read_file 补读插件已接管的媒体时，若该媒体正在识别中最多等待的秒数（等到即返回真描述）；0=不等直接返回空占位"
       }
     }
   },

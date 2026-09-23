@@ -11,7 +11,7 @@ import pathlib
 HERE = pathlib.Path(__file__).resolve().parent
 PLUGIN = HERE.parent
 
-SUITES = ["test_guard_await.py", "test_prefetch_timing.py", "test_prefetch_scope.py",
+SUITES = ["test_guard_await.py", "test_guard_known_media.py", "test_prefetch_timing.py", "test_prefetch_scope.py",
           "test_foreign_event.py", "test_queue_timing.py", "test_media_fixes.py"]
 
 rc = 0
