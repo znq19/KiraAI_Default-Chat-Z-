@@ -109,6 +109,15 @@ class ParallelMediaRecognizer:
         # 不再占用 stage2/stage3 关键路径的会话级/全局级信号量 —— 多会话图片风暴时
         # 预取不会挤占兜底识别的并发槽。
         self.vlm_prefetch_max_parallel = int(sec.get("vlm_prefetch_max_parallel", 4))
+        # 预取独立超时（默认 30s，clamp 到 [5s, media_timeout]）：60s 超时的在途项会
+        # 长时间占满预取信号量的槽位，饿死后续预取（排队 60s+ 才开始识别）。预取是
+        # 「锦上添花」的后台优化，给它更短的预算；stage2/stage3 关键路径仍吃完整
+        # media_timeout。
+        self.vlm_prefetch_timeout = max(5.0, min(self.media_timeout,
+                                                 float(sec.get("vlm_prefetch_timeout", 30.0))))
+        # 在途预取任务上限（默认 16）：超限直接跳过新预取（不置 _done，媒体仍由
+        # stage2 正常接力识别）——防媒体风暴时在途任务表无界增长、槽位长期被占。
+        self.vlm_prefetch_max_queue = int(sec.get("vlm_prefetch_max_queue", 16))
         # 到达即落盘（插件自有媒体缓存，默认开）：url 型媒体在 stage1 即把字节持久化到
         # data/plugins_media_cache/ 并设置 elem._temp_path —— URL 过期后本地字节仍在
         # （识别/渲染/read_file 全链免疫），且框架 temp_monitor 的 60s 保护期清理管不到
@@ -129,6 +138,10 @@ class ParallelMediaRecognizer:
         # 官方就会付费识图，事后无法挽回。关掉即恢复"框架自己识图"的原始行为
         # （配合 bot_config.capabilities.image_recognition.enabled 一起用）。
         self.guard_enabled = bool(sec.get("guard_framework_vlm", True))
+        # guard 拦截框架 read_file 补读时的在途短等（默认 8s，0=不等直接返回空占位）：
+        # 若该媒体此刻正在插件流水线里识别，最多等这几秒拿真描述返回（LLM 补读体验更好）；
+        # 等不到也返回 ""——识别由插件负责，绝不放行走框架 VLM 二次付费。
+        self.guard_read_file_wait = float(sec.get("guard_read_file_wait", 8.0))
         # ── 预取池（真·预处理）────────────────────────────────────────────
         # 场景：消息已确定进入批次，而上一个批次的 LLM 还在跑 / 本批次还在队列里排队。
         # 这段空窗不该浪费 —— 立刻在后台把 VLM/STT 跑掉；放行时 stage2 直接命中结果，
@@ -140,6 +153,13 @@ class ParallelMediaRecognizer:
         self._results_pool: dict[str, dict] = {}
         self._pf_tasks: dict[str, "asyncio.Task"] = {}
         self._pf_infos: dict[str, dict] = {}
+        # guard「已知媒体」登记（read_file 收口用，见 _guarded_desc_img）：凡是插件管线
+        # 见过（将识别/已识别/已缓存）的媒体指纹都登记在此——框架 agent 的 read_file
+        # 补读这些媒体时由 guard 拦截（返回空占位/在途描述），不再触发第二次付费 VLM。
+        # 刻意不登记用户配置「不识别」的媒体（_media_skip 分支）：那是省 VLM 的既定语义。
+        # 有界 FIFO（md5 cap 4096 / phash cap 2048，超限淘汰最旧一半）。
+        self._known_md5: dict[str, None] = {}
+        self._known_phash: dict[str, None] = {}
         self.quality_enabled = sec.get("quality_enabled", False)
         self.quality_value = int(sec.get("quality_value", 85))
 
@@ -608,6 +628,10 @@ class ParallelMediaRecognizer:
             elem.caption = ""  # 官方空占位 + 阻止框架自动 VLM（caption 非 None）
             return
         md5 = await self._elem_md5(elem)
+        if md5:
+            # guard 已知媒体登记（含下方缓存命中提前 return 的分支）：此后框架 read_file
+            # 补读该媒体由 guard 拦截，不再二次付费 VLM
+            self._remember_known(md5=md5)
         short_id = md5[:8] if md5 else f"noid_{id(elem)}"
         # 把本阶段使用的键钉在元素上：框架 handle_im_batch_message 会在渲染前调用
         # compress_image_element()（media.md5 = None + 换文件），随后 message_format_to_text
@@ -649,6 +673,7 @@ class ParallelMediaRecognizer:
         except Exception:
             md5 = None
         if md5:
+            self._remember_known(md5=md5)   # guard 已知媒体登记（同 _prefill_media）
             short_id = md5[:8]
             desc = await self._cache_get(md5) or ""
             if desc and not self._is_valid_desc(desc):
@@ -985,9 +1010,15 @@ class ParallelMediaRecognizer:
             batch_img_sem = None   # 预取走独立信号量（_prefetch_sem），不占批次/会话/全局槽
             batch_aud_sem = None
             started = 0
+            skipped = 0
             for media_id, info in media.items():
                 if self._has_desc(sid, media_id) or media_id in self._pf_tasks:
                     continue          # 已有描述 → 不重复；正在飞 → 去重（失败后允许再试）
+                if len(self._pf_tasks) >= self.vlm_prefetch_max_queue:
+                    # 在途预取队列已满：跳过新预取防占槽饥饿。刻意**不置 _done**——
+                    # 跳过的媒体仍由 stage2 正常接力识别，不会漏图
+                    skipped += 1
+                    continue
                 info["_done"] = True
                 info["_prefetch"] = True        # 预取标记：_describe_one/_transcribe_one 据此
                 info["_mr_source"] = "prefetch"  # 走独立信号量 + 先落盘 + 日志来源前缀
@@ -1007,6 +1038,11 @@ class ParallelMediaRecognizer:
                 logger.info(
                     f"[MediaRecognize] 预取启动 {started} 项（{sid}，"
                     f"{reason or '后台识别'}，不阻塞主流程）"
+                )
+            if skipped:
+                logger.debug(
+                    f"[MediaRecognize] 预取在途队列已满（上限 {self.vlm_prefetch_max_queue}），"
+                    f"跳过 {skipped} 项新预取（媒体仍由 stage2 正常识别）"
                 )
         except Exception as e:
             logger.debug(f"prefetch worker failed: {type(e).__name__}: {e}")
@@ -1035,6 +1071,7 @@ class ParallelMediaRecognizer:
             info["_done"] = True
             results[media_id] = cached
             return
+        eff_timeout = self.media_timeout   # 实际生效超时（预取分支用更短的独立预算）
         try:
             if info.get("_prefetch"):
                 # 预取并发隔离：先落盘（URL 失效免疫，识别直接吃本地字节），识别只占
@@ -1043,10 +1080,13 @@ class ParallelMediaRecognizer:
                     await self._persist_media(info.get("elem"), md5)
                 except Exception:
                     pass
+                # 预取独立超时（默认 30s，短于 media_timeout）：超时项长时间占满预取
+                # 槽位会饿死后续预取；stage2/stage3 仍吃完整 media_timeout（见 else 分支）
+                eff_timeout = min(self.media_timeout, self.vlm_prefetch_timeout)
                 async with self._prefetch_sem:
                     desc = await asyncio.wait_for(
                         self._describe_image(info["elem"], sess_sid, media_id=media_id,
-                                             source=source), self.media_timeout)
+                                             source=source), eff_timeout)
             else:
                 sess_sem = self._session_sem(self._session_img_sems, sess_sid, self.vlm_max_parallel_per_session)
                 # 三层限流：批次级 → 会话级 → 全局级（固定获取顺序，无死锁）
@@ -1077,7 +1117,7 @@ class ParallelMediaRecognizer:
                 results[media_id] = "(未识别)"
         except asyncio.TimeoutError:
             info["_done"] = True
-            logger.warning(f"[MediaRecognize:{source}] image describe timeout id={media_id}（>{self.media_timeout:.0f}s）")
+            logger.warning(f"[MediaRecognize:{source}] image describe timeout id={media_id}（>{eff_timeout:.0f}s）")
             results[media_id] = "(识别超时)"
         except Exception as e:
             info["_done"] = True
@@ -1744,8 +1784,108 @@ class ParallelMediaRecognizer:
                 for k in list(_PHASH_INDEX)[: _PHASH_INDEX_MAX // 2]:
                     _PHASH_INDEX.pop(k, None)
             _PHASH_INDEX[ph] = desc
+            self._remember_known(phash=ph)   # guard 已知媒体登记（同图重压缩副本收口）
         except Exception:
             pass
+
+    # ================= guard 已知媒体登记（read_file 收口用） =================
+
+    def _remember_known(self, md5: Optional[str] = None, phash: Optional[str] = None):
+        """登记「本插件已接管」的媒体指纹（进程内、有界 FIFO，全程静默）。
+
+        登记点：stage1 _prefill_media / _replace_media（md5 算出即登记，含缓存命中
+        分支）、_persist_media（字节在手，顺手 dHash）、_phash_remember（识别成功后）。
+        用户配置「不识别」的媒体（_media_skip 提前 return 分支）刻意**不登记**——
+        guard 不拦截、read_file 放行原函数，尊重用户省 VLM 的既定语义。
+        """
+        try:
+            if md5:
+                if len(self._known_md5) >= 4096:
+                    for k in list(self._known_md5)[:2048]:
+                        self._known_md5.pop(k, None)
+                self._known_md5[md5] = None
+            if phash:
+                if len(self._known_phash) >= 2048:
+                    for k in list(self._known_phash)[:1024]:
+                        self._known_phash.pop(k, None)
+                self._known_phash[phash] = None
+        except Exception:
+            pass
+
+    def _phash_known(self, ph: Optional[str]) -> bool:
+        """已知 phash 登记的存在性判定（hamming≤2 近似，扫描方式同 _phash_nearest）。"""
+        if not ph:
+            return False
+        try:
+            v = int(ph, 16)
+        except Exception:
+            return False
+        for k in self._known_phash:
+            try:
+                if bin(v ^ int(k, 16)).count("1") <= 2:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _known_media_check(self, image) -> tuple:
+        """判定该媒体是否「本插件已接管」（guard 收口用，全程防御绝不抛）。
+
+        取数逻辑与 _desc_index_lookup 一致（image.md5 / _temp_path / path 型 file →
+        读本地字节现算 md5）。返回 (known, md5, phash)：md5 命中已知登记 →
+        (True, md5, None)；否则有本地字节时算 dHash 对已知登记做 hamming≤2 近似匹配
+        → (True, md5, ph)；都不中 (False, md5, ph)；任何异常 (False, None, None)。
+        """
+        try:
+            data = None
+            md5 = getattr(image, "md5", None) or None
+            local = getattr(image, "_temp_path", None)
+            if not local and getattr(image, "file_type", "") == "path":
+                local = getattr(image, "file", None)
+            if not md5 and local:
+                data = await self._read_media_bytes(local)
+                if data:
+                    md5 = hashlib.md5(data).hexdigest()
+            if md5 and md5 in self._known_md5:
+                return True, md5, None
+            if data is None and local:
+                data = await self._read_media_bytes(local)
+            ph = None
+            if data:
+                ph = await asyncio.to_thread(self._phash_of_bytes, data)
+            if ph and self._phash_known(ph):
+                return True, md5, ph
+            return False, md5, ph
+        except Exception:
+            return False, None, None
+
+    async def _await_inflight_desc(self, md5: Optional[str], phash: Optional[str],
+                                   timeout: float) -> Optional[str]:
+        """guard 拦截 read_file 补读时：短等该媒体的在途识别，拿到真描述就返回。
+
+        shield 包裹在途任务：等待方超时**不取消**识别任务本身（识别仍由插件流水线
+        收尾）。随后依次查持久缓存（md5）与 dHash 索引（phash），返回首个有效描述；
+        无在途/超时/任何失败返回 None（调用方降级返回空占位）。
+        """
+        try:
+            if md5:
+                task = self._pf_tasks.get(md5[:8])
+                if task is not None:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(task), timeout)
+                    except Exception:
+                        pass
+            if md5:
+                desc = await self._cache_get(md5)
+                if desc and self._is_valid_desc(desc):
+                    return desc
+            if phash:
+                desc = self._phash_nearest(phash)
+                if desc and self._is_valid_desc(desc):
+                    return desc
+        except Exception:
+            pass
+        return None
 
     async def _fill_empty_official_by_path(self, req, sid: str) -> int:
         """把请求文本里的**官方空占位**按 file_path 的内容哈希补成描述（零 VLM）。
@@ -1888,6 +2028,15 @@ class ParallelMediaRecognizer:
             if not data:
                 return None
             md5v = md5 or hashlib.md5(data).hexdigest()
+            # guard 已知媒体登记：字节已在手，图片/表情顺手算 dHash（同图重压缩副本
+            # 也能被 guard 识别为已知媒体）；失败静默，不影响落盘主流程
+            try:
+                _ph = None
+                if elem.__class__.__name__ in ("Image", "Sticker"):
+                    _ph = await asyncio.to_thread(self._phash_of_bytes, data)
+                self._remember_known(md5=md5v, phash=_ph)
+            except Exception:
+                pass
             ext = ""
             try:
                 mime = (getattr(elem, "mime", None) or "").split(";")[0].strip()
@@ -2158,6 +2307,26 @@ def install_desc_img_guard(recognizer) -> int:
                         return hit
             except Exception:
                 pass
+            # (a2) 已知媒体收口：媒体指纹已被插件登记（将识别/已识别/已缓存），说明
+            # 插件流水线已接管它 —— 框架 read_file 补读绝不再触发第二次付费 VLM。
+            # 在途识别可短等拿真描述（guard_read_file_wait）；等不到返回空占位。
+            # 刻意不拦截：用户配置「不识别」的媒体（未登记）与从未见过的工作区文件
+            # —— 前者尊重省 VLM 意图，后者保持 read_file 对任意文件的可用性不变。
+            try:
+                known, md5, ph = await recognizer._known_media_check(image)
+            except Exception:
+                known, md5, ph = False, None, None
+            if known:
+                wait_s = float(getattr(recognizer, "guard_read_file_wait", 8) or 0)
+                if wait_s > 0:
+                    try:
+                        desc = await recognizer._await_inflight_desc(md5, ph, wait_s)
+                    except Exception:
+                        desc = None
+                    if desc:
+                        return desc
+                logger.info("[MediaRecognize:guard] 拦截框架 VLM 补读：插件已接管该媒体，不重复付费（返回空占位，识别由插件流水线负责）")
+                return ""
             # (b) 未命中调原函数并包 wait_for(media_timeout)；
             # (c) 异常/超时返回 ""（与原契约一致：框架调用方本就按 "" 降级）
             try:

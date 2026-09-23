@@ -1,4 +1,4 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.8.11
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.8.12
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
@@ -31,6 +31,33 @@
 
 <details>
 <summary>更新日志</summary>
+
+### v1.8.12
+
+- **guard 已知媒体收口（read_file 双重付费堵漏）**
+  - **现象**（用户日志）：LLM 循占位文本里的 file_path 用 read_file 补读图片 → 框架
+    `_describe_image_file` 直接调 desc_img（不看 caption），旧 guard 在插件索引未命中时
+    放行原函数 → **框架 VLM 付费识别一次、插件 stage3 又识别一次**（日志里
+    `[llm] Describing image using …` 与 `[MediaRecognize:stage3]` 同时出现）。
+  - **修复**：插件管线见过的媒体指纹全部登记在案（`_known_md5` cap 4096 /
+    `_known_phash` cap 2048，有界 FIFO）——stage1 预填充/语音替换、到达即落盘
+    （顺手 dHash）、识别成功后四处登记。guard 拦截 read_file 对**已知媒体**的补读：
+    该媒体正在识别时最多短等 `guard_read_file_wait`（默认 8s，0=不等）拿真描述返回，
+    等不到返回空占位（识别由插件流水线负责）——**绝不再触发第二次付费 VLM**。
+  - **刻意不拦截**：用户配置「不识别」的媒体（_media_skip 分支不登记，保持省 VLM
+    意图，read_file 放行原函数）；从未见过的工作区文件照常放行——**read_file 对任意
+    文件的可用性不变**。
+- **预取占槽饥饿修复**
+  - **现象**（用户日志）：60s 超时的在途项长时间占满预取信号量（vlm_prefetch_max_parallel=4），
+    新预取「预取启动」到「Describing」排队 69s+ 才开始识别。
+  - **修复**：预取独立超时 `vlm_prefetch_timeout`（默认 30s，clamp 到 [5s, media_timeout]，
+    新增配置项）——预取是锦上添花的后台优化，给它更短的预算；stage2/stage3 关键路径
+    仍吃完整 media_timeout。在途预取任务上限 `vlm_prefetch_max_queue`（默认 16，新增
+    配置项）——超限跳过新预取且**不置 _done**，媒体仍由 stage2 正常接力识别，不漏图。
+- **回归测试** `tests/test_guard_known_media.py`（T1~T6，与 s 版同源）：已知 md5/phash
+  拦截且原函数零调用、未知图片放行、在途短等拿真描述、队列上限跳过不置 _done、
+  预取独立超时实际生效。
+- 版本 v1.8.11 → v1.8.12（与 s 版 v2.5.21 同步；`media_recognize.py` 两版逐字节一致）
 
 ### v1.8.11
 
