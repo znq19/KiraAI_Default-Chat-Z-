@@ -1,4 +1,4 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.10.4
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.10.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
@@ -32,6 +32,19 @@
 
 <details>
 <summary>更新日志</summary>
+
+### v1.10.5
+
+- **适配 KiraAI 3.1.1 新增的 TypeSafe 决策模型提供商**：框架把决策模型放在 provider 的
+  `model_config.decision` 分组，而配置页一个模型字段只能绑定一个 `model_type`（框架限制）⇒
+  新增独立的多选「JEV 决策模型组（TypeSafe · 3.1.1+）」，与原有「JEV 模型组（OpenAI 兼容）」
+  按「llm 组 → 决策组 → 手动」合并成同一条有序回退链。两组都留空 = 旧行为逐字节不变。
+- **移除旧版手动 JEV 连接配置**：`jev_base_url` / `jev_api_key` / `jev_model_name` 不再出现在设置页；
+  旧值一律**忽略**（启动日志会提示），请改用「提供商 + JEV 模型组」。
+- **修复图片识别日志显示内部 uuid**：`[MediaRecognize:*] Describing image using …` 在 3.x 打印的是
+  `model_id`（uuid），改为优先人类可读的 `model_name`；2.x 无 `model_name` 时回落 `model_id`，旧行为不变。
+- 测试：新增决策模型组链路/空值等价/日志模型名用例；既有全套件全绿
+- 版本 1.10.4 → 1.10.5
 
 ### v1.10.4
 
