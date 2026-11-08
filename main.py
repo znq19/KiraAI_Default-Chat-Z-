@@ -1914,9 +1914,32 @@ class DebouncePlugin(BasePlugin):
             return
         if self.group_chat_prompt:
             for p in req.system_prompt:
-                if p.name == "chat_env":
-                    p.content += self.group_chat_prompt
+                if getattr(p, "name", "") != "chat_env":
+                    continue
+                if getattr(p, "_sustain_group_prompt_added", False):
                     break
+                try:
+                    setattr(p, "_sustain_group_prompt_added", True)
+                except Exception:
+                    pass
+                try:
+                    # 先渲染 chat_env 模板，再按纯文本追加（避免用户 {} 进 Jinja）
+                    rendered = (
+                        p.to_string() if getattr(p, "render_template", False)
+                        else (p.content or "")
+                    )
+                    _end = getattr(p, "end", "\n") or ""
+                    if _end and rendered.endswith(_end):
+                        rendered = rendered[:-len(_end)]
+                    p.content = rendered + self.group_chat_prompt
+                    p.render_template = False
+                except Exception:
+                    try:
+                        p.content = (p.content or "") + self.group_chat_prompt
+                        p.render_template = False
+                    except Exception:
+                        pass
+                break
 
     # ================= 队列合并 / 积压处理（转发给 BatchMergeScheduler） =================
 
