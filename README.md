@@ -18,7 +18,7 @@
 - **原生多模态兼容**：native 图片模式下图片保留在链中由框架原生直传（官方压缩 + 持久化引用），本插件不预置 caption、不截断数量限制；转发/语音策略照旧（转发仅唤醒才保留、语音 STT 由本插件处理）
 - **JEV 触发决策（可选 · 默认关）**：主动概率掷骰之外加一层语义裁判——[JEV（TypeSafe System-One）](https://typesafe.ai/) 不生成文本、只输出「reply/wait + 置信度」（输入 $0.042/MTok、输出免费、70~500ms）；命中后可复核否决（confirm）、未命中可补判拉起（boost）；否决时评分门 boost 已清的分自动回补（单调不减）；熔断/弃权一律回退机械逻辑，后台执行零阻塞。模型在 `section_jev` 下拉多选（借道 webui 已注册提供商，有序回退链），也可用 `aux_llm` 后端拿任意小模型当判官（延迟/成本更高，配置页有明示）
 
-想要更多能力？推荐安装 **sustained-chat**（[KiraAI_sustained_chat_plugin](https://github.com/znq19/KiraAI_sustained_chat_plugin)），支持群聊持续对话、私聊主动、定时任务等完整主动社交能力。
+想要更多能力？推荐安装 **sustained-chat**（[KiraAI_sustained_chat_plugin](https://github.com/znq19/KiraAI_sustained_chat_plugin)），支持群聊持续对话、私聊主动、定时任务等完整主动社交能力。⚠ **两者互斥**：同时安装时 S 版优先，Z 会自动停用；如需运行 Z，请先禁用 S。
 
 ## 安装
 
