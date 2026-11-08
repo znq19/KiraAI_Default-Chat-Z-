@@ -860,6 +860,14 @@
         "default": true,
         "hint": "开启后每次 JEV 判定把当前人格（名字+内容）放进判定上下文，「在叫 bot 吗」这类判断更准（对齐官方 jev 插件的做法）。关闭=旧行为。"
       },
+      "jev_context_messages": {
+        "type": "integer",
+        "name": "判定附带上下文条数",
+        "default": 10,
+        "minimum": 0,
+        "maximum": 50,
+        "hint": "每次判定除「本批判断对象」外，额外附带截至本批之前的最近 N 条会话（含 bot 自己的真实发言，只取更早记录，不包含本批与判定期间新消息）。0=只送本批。"
+      },
       "jev_backend": {
         "type": "string",
         "name": "判定后端",

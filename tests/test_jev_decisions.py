@@ -505,8 +505,12 @@ async def l1_llm_parse_and_chain(jev):
     oks = [
         p('{"choice":"reply","confidence":0.9}')[0] == "reply",
         p('……\n{"choice":"wait","confidence":0.2}\n……')[0] == "wait",
-        p('I choose to reply now') == ("reply", 0.5),
-        p('wait 一下')[0] == "wait",
+        # 旧版宽松关键词兜底已移除：解释性/错误文本不能被当成判定
+        p('I choose to reply now')[0] is None,
+        p('wait 一下')[0] is None,
+        p('  "wait"  ') == ("wait", 0.5),
+        p('reply.') == ("reply", 0.5),
+        p('我先想想 {"choice":"wait"} 最终 {"choice":"reply","confidence":0.8}')[0] == "reply",
         p('胡说八道没有答案')[0] is None,
         p('{"choice":"reply","confidence":"bad"}')[1] == 0.5,
         p('{"choice":"reply","confidence":9}')[1] == 1.0,   # clamp
@@ -530,9 +534,11 @@ async def l1_llm_parse_and_chain(jev):
     fail_ok = r3 is None and cli3.fails == 1
     return {
         "L1 解析：JSON块": oks[0], "L1 解析：噪声包裹": oks[1],
-        "L1 解析：关键词兜底 reply": oks[2], "L1 解析：关键词兜底 wait": oks[3],
-        "L1 解析：无答案 None": oks[4], "L1 解析：坏置信度回落0.5": oks[5],
-        "L1 解析：置信度钳制": oks[6],
+        "L1 解析：解释文本不猜 reply": oks[2], "L1 解析：解释文本不猜 wait": oks[3],
+        "L1 解析：严格整行 wait": oks[4], "L1 解析：严格整行 reply": oks[5],
+        "L1 解析：取最后一个 JSON 块": oks[6],
+        "L1 解析：无答案 None": oks[7], "L1 解析：坏置信度回落0.5": oks[8],
+        "L1 解析：置信度钳制": oks[9],
         "L1 解析失败自动换档": chain_ok, "L1 低置信弃权": abstain_ok,
         "L1 全档失败 None 且计熔断": fail_ok,
     }

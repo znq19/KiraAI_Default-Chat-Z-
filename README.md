@@ -1,4 +1,4 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.10.5
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.10.6
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
@@ -18,7 +18,7 @@
 - **原生多模态兼容**：native 图片模式下图片保留在链中由框架原生直传（官方压缩 + 持久化引用），本插件不预置 caption、不截断数量限制；转发/语音策略照旧（转发仅唤醒才保留、语音 STT 由本插件处理）
 - **JEV 触发决策（可选 · 默认关）**：主动概率掷骰之外加一层语义裁判——[JEV（TypeSafe System-One）](https://typesafe.ai/) 不生成文本、只输出「reply/wait + 置信度」（输入 $0.042/MTok、输出免费、70~500ms）；命中后可复核否决（confirm）、未命中可补判拉起（boost）；否决时评分门 boost 已清的分自动回补（单调不减）；熔断/弃权一律回退机械逻辑，后台执行零阻塞。模型在 `section_jev` 下拉多选（借道 webui 已注册提供商，有序回退链），也可用 `aux_llm` 后端拿任意小模型当判官（延迟/成本更高，配置页有明示）
 
-想要更多能力？推荐安装 **sustained-chat**（[KiraAI_sustained_chat_plugin](https://github.com/znq19/KiraAI_sustained_chat_plugin)），支持群聊持续对话、私聊主动、定时任务等完整主动社交能力。
+想要更多能力？推荐安装 **sustained-chat**（[KiraAI_sustained_chat_plugin](https://github.com/znq19/KiraAI_sustained_chat_plugin)），支持群聊持续对话、私聊主动、定时任务等完整主动社交能力。⚠ **两者互斥**：同时安装时 S 版优先，Z 会自动停用；如需运行 Z，请先禁用 S。
 
 ## 安装
 
@@ -33,12 +33,30 @@
 <details>
 <summary>更新日志</summary>
 
+### v1.10.6
+
+- **JEV 判定输入对齐 S 版**：删除 3.x「最近 20 条档案整体覆盖 state」，改为
+  「本批判断对象 + 截至本批之前的有限上下文（`jev_context_messages`，默认 10 条，
+  含 bot 自己的真实发言；不含本批/更新消息/notice/未送达/bot 回声）」；
+- **aux LLM 判官修复**：`LLMResponse.status=error` 按失败处理；解析改为
+  「最后一个 JSON 块 + 严格整行 reply/wait」；判定标准与 JEV 共用 `TRIGGER_CRITERIA`；
+- **日志可读**：模型组/回退链/判定结果输出「模型名 (提供商名)」+ `via 模型@主机`，
+  不再打印裸 uuid；
+- **资源/竞态**：JEV 惰性 `httpx.AsyncClient` 在 terminate 关闭；`_jev_spawn`
+  去重时关闭未 await 的协程；延迟判定在消息已被真唤醒 flush 走时放弃触发；
+- **群聊提示词安全**：先渲染 `chat_env` 再按纯文本追加，避免用户文本 `{}` 被 Jinja
+  解析，同时保留原块/顺序/缓存；
+- **与 S 版互斥**：检测到 `sustained-chat` 已启用时，Z 版自动停用自己
+  （S 为完整版，优先级更高），避免双重防抖/重复处理；
+- 测试：新增上下文窗口/严格解析/httpx/aclose 等用例；全量回归通过。
+- 版本 1.10.5 → 1.10.6
+
 ### v1.10.5
 
 - **适配 KiraAI 3.1.1 新增的 TypeSafe 决策模型提供商**：框架把决策模型放在 provider 的
   `model_config.decision` 分组，而配置页一个模型字段只能绑定一个 `model_type`（框架限制）⇒
   新增独立的多选「JEV 决策模型组（TypeSafe · 3.1.1+）」，与原有「JEV 模型组（OpenAI 兼容）」
-  按「llm 组 → 决策组 → 手动」合并成同一条有序回退链。两组都留空 = 旧行为逐字节不变。
+  按「llm 组 → 决策组」合并成同一条有序回退链。两组都留空 = 旧行为逐字节不变。
 - **移除旧版手动 JEV 连接配置**：`jev_base_url` / `jev_api_key` / `jev_model_name` 不再出现在设置页；
   旧值一律**忽略**（启动日志会提示），请改用「提供商 + JEV 模型组」。
 - **修复图片识别日志显示内部 uuid**：`[MediaRecognize:*] Describing image using …` 在 3.x 打印的是

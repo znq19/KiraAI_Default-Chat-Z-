@@ -13,7 +13,8 @@ PLUGIN = HERE.parent
 
 SUITES = ["test_logger_level_guard.py", "test_guard_await.py", "test_guard_known_media.py", "test_prefetch_timing.py", "test_prefetch_scope.py",
           "test_foreign_event.py", "test_queue_timing.py", "test_media_fixes.py", "test_debounce_arrival_race.py",
-          "test_jev_decisions.py", "test_guard_sticker_bypass.py", "test_rc1_compat.py", "test_mute_notice_perception.py"]
+          "test_jev_decisions.py", "test_jev_ga_upgrade.py",
+          "test_guard_sticker_bypass.py", "test_rc1_compat.py", "test_mute_notice_perception.py"]
 
 rc = 0
 for suite in SUITES:
