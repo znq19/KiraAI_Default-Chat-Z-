@@ -1,4 +1,4 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.10.5
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.10.6
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
@@ -32,6 +32,22 @@
 
 <details>
 <summary>更新日志</summary>
+
+### v1.10.6
+
+- **JEV 判定输入对齐 S 版**：删除 3.x「最近 20 条档案整体覆盖 state」，改为
+  「本批判断对象 + 截至本批之前的有限上下文（`jev_context_messages`，默认 10 条，
+  含 bot 自己的真实发言；不含本批/更新消息/notice/未送达/bot 回声）」；
+- **aux LLM 判官修复**：`LLMResponse.status=error` 按失败处理；解析改为
+  「最后一个 JSON 块 + 严格整行 reply/wait」；判定标准与 JEV 共用 `TRIGGER_CRITERIA`；
+- **日志可读**：模型组/回退链/判定结果输出「模型名 (提供商名)」+ `via 模型@主机`，
+  不再打印裸 uuid；
+- **资源/竞态**：JEV 惰性 `httpx.AsyncClient` 在 terminate 关闭；`_jev_spawn`
+  去重时关闭未 await 的协程；延迟判定在消息已被真唤醒 flush 走时放弃触发；
+- **与 S 版互斥**：检测到 `sustained-chat` 已启用时，Z 版自动停用自己
+  （S 为完整版，优先级更高），避免双重防抖/重复处理；
+- 测试：新增上下文窗口/两组链路/严格解析等用例；全量回归通过。
+- 版本 1.10.5 → 1.10.6
 
 ### v1.10.5
 
