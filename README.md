@@ -44,6 +44,8 @@
   不再打印裸 uuid；
 - **资源/竞态**：JEV 惰性 `httpx.AsyncClient` 在 terminate 关闭；`_jev_spawn`
   去重时关闭未 await 的协程；延迟判定在消息已被真唤醒 flush 走时放弃触发；
+- **群聊提示词安全**：先渲染 `chat_env` 再按纯文本追加，避免用户文本 `{}` 被 Jinja
+  解析，同时保留原块/顺序/缓存；
 - **与 S 版互斥**：检测到 `sustained-chat` 已启用时，Z 版自动停用自己
   （S 为完整版，优先级更高），避免双重防抖/重复处理；
 - 测试：新增上下文窗口/两组链路/严格解析等用例；全量回归通过。
@@ -54,7 +56,7 @@
 - **适配 KiraAI 3.1.1 新增的 TypeSafe 决策模型提供商**：框架把决策模型放在 provider 的
   `model_config.decision` 分组，而配置页一个模型字段只能绑定一个 `model_type`（框架限制）⇒
   新增独立的多选「JEV 决策模型组（TypeSafe · 3.1.1+）」，与原有「JEV 模型组（OpenAI 兼容）」
-  按「llm 组 → 决策组 → 手动」合并成同一条有序回退链。两组都留空 = 旧行为逐字节不变。
+  按「llm 组 → 决策组」合并成同一条有序回退链。两组都留空 = 旧行为逐字节不变。
 - **移除旧版手动 JEV 连接配置**：`jev_base_url` / `jev_api_key` / `jev_model_name` 不再出现在设置页；
   旧值一律**忽略**（启动日志会提示），请改用「提供商 + JEV 模型组」。
 - **修复图片识别日志显示内部 uuid**：`[MediaRecognize:*] Describing image using …` 在 3.x 打印的是
