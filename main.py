@@ -181,6 +181,21 @@ class DebouncePlugin(BasePlugin):
             value = self.ctx.config["bot_config"].get("bot", {}).get("max_message_interval", 1.5)
         return max(0.1, _safe_float(value, 1.5))
 
+    @property
+    def max_buffer_messages(self) -> int:
+        override = getattr(self, "_max_buffer_messages_override", None)
+        if override is not None:
+            return override
+        value = self.ctx.config.get_config("bot_config.bot.max_buffer_messages", None)
+        if value is None:
+            value = self.ctx.config["bot_config"].get("bot", {}).get("max_buffer_messages", 3)
+        return _safe_int(value, 3)
+
+    @max_buffer_messages.setter
+    def max_buffer_messages(self, value) -> None:
+        # 保留既有测试/外部定制直接赋值；正常路径实时读取 WebUI。
+        self._max_buffer_messages_override = _safe_int(value, 3)
+
     def _merge_base_interval(self) -> float:
         configured = getattr(self, "merge_window_seconds", -1)
         return float(configured) if configured > 0 else self.debounce_interval
@@ -215,7 +230,6 @@ class DebouncePlugin(BasePlugin):
         #   TTL + 上限见 _remember_real_batch（防长时间运行无界增长）。
         self._real_batches: dict[str, float] = {}
         bot_cfg = ctx.config["bot_config"].get("bot", {})
-        self.max_buffer_messages = _safe_int(bot_cfg.get("max_buffer_messages"), 3)
         # === 分组读取辅助：从 section 结构取值（兼容旧扁平残留） ===
         def _sec(section_name, key, default):
             _sec_cfg = self.plugin_cfg.get(section_name, {}) or {}
@@ -246,6 +260,8 @@ class DebouncePlugin(BasePlugin):
                 ("adaptive_merge_max_batch_wait", 0),
                 ("adaptive_merge_allow_below_base", False),
                 ("adaptive_merge_min_seconds", 0),
+                ("adaptive_merge_sample_half_life_seconds", 480),
+                ("adaptive_merge_near_miss_ttl_seconds", 480),
             )
         }
         self.adaptive_merge = AdaptiveMergePolicy(self._merge_base_interval, _adaptive_cfg)
