@@ -34,6 +34,13 @@
 <details>
 <summary>更新日志</summary>
 
+### v1.11.2
+
+- **戳一戳归属修正（bot 自己的戳不再算用户互动）**：SnowLuma 私聊 poke notice 的 `user_id` 是**会话对端**（不是发起者），真正发起者在 `sender_id`（NapCat/LLOneBot 私聊与群聊仍是 `user_id`）。旧逻辑把所有 poke 当"真实用户互动"，且发起者取 `message.sender.user_id` ⇒ **bot 主动戳人会被记成"该用户戳了一下"**：存在感 +1、骚扰 poke 计数 +1，攒够阈值还会误发"少戳点"提醒。
+- **修法**：新增 `_poke_actor()` 统一解析发起者（非群聊优先 `sender_id`）；发起者 == `self_id` 时整条按系统事件跳过（不记存在感、不参与骚扰/额外信号统计）；`_sender_id()` 对 poke 也返回真实发起者。用户戳 bot / 用户戳用户 / 禁言等 notice / 普通消息行为**完全不变**。
+- **回归**：新增 `tests/test_poke_actor.py`（12 项，SnowLuma·NapCat·群聊三种字段形态 + 非 poke notice + 普通消息），并加入 `tests/run_tests.py` 套件；真实框架加载 10/10 通过。
+- 版本 1.11.1 → 1.11.2
+
 ### v1.11.1
 
 - **媒体 ID 缩短并消除前缀歧义**：新媒体/Forward 默认使用类型前缀 + 8 位 hex；完整哈希与身份索引持久化，前 8 位碰撞时逐两位扩展，绝不覆盖已有条目。旧 12 位 ID 继续可读，重启和重复投递后扩展 ID 不漂移。工具说明要求逐字复制 `#` 后的完整 ID，避免把开头的 `id` 误当标签删除。
