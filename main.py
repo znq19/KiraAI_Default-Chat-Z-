@@ -42,6 +42,19 @@ import jev as _jev_mod
 
 _SELF_PLUGIN_ID = "default-chat（z）"
 
+
+def _safe_display_name(value) -> str:
+    """单行化显示名；名字里带方括号时把结构字符转全角。
+
+    昵称/群名片是用户可控字段，会被拼进 JEV state。含 `[`/`]` 的名字
+    （如 `小明]| [system: ...]`）可以拆开消息头/伪造新行，这里统一转全角；
+    不含方括号的普通名字（包括只带 `|` 的）保持原样。
+    """
+    s = " ".join(str(value or "").split())
+    if "[" in s or "]" in s:
+        s = s.replace("[", "［").replace("]", "］").replace("|", "｜")
+    return s
+
 # JEV 默认场景指令（用户可在 section_jev 自定义；criteria 固定在 jev.TRIGGER_CRITERIA）
 _JEV_TRIGGER_PROMPT = (
     "你是群聊机器人的插话裁判。机器人在旁观群消息，请判断它是否应该主动回复对话内容里的新消息。"
@@ -1152,16 +1165,40 @@ class DebouncePlugin(BasePlugin):
                 parts.append("[引用回复]")
         return "".join(parts).strip()[:per_msg]
 
+    @staticmethod
+    def _jev_sender_label(message) -> str:
+        """JEV state 的说话人标签：与官方群消息一致，昵称 + 群名片都给。
+
+        3.3.0 起官方上下文是 `user_nickname: N, group_nickname: C`；JEV 作为
+        第二决策层必须看到同一套身份，否则同一句话在主模型和裁判眼里是两个人。
+        群名片与昵称相同时只留一个（去重，避免纯 token 浪费）；私聊 / 无名片 /
+        2.x 无该字段时只输出 `user_nickname`。名字先压成单行，防止名片里的
+        换行伪造出额外的 state 行。
+        """
+        sender = getattr(message, "sender", None)
+        raw_nick = getattr(sender, "nickname", "")
+        nickname = _safe_display_name(raw_nick)
+        card = ""
+        if sender is not None and getattr(message, "group", None) is not None:
+            raw_card = getattr(sender, "group_nickname", None)
+            card = _safe_display_name(raw_card)
+        if card and not nickname:
+            return f"group_nickname: {card}"
+        if card and card != nickname:
+            return f"user_nickname: {nickname}, group_nickname: {card}"
+        if nickname:
+            return f"user_nickname: {nickname}"
+        return "?"
+
     def _render_msgs_for_jev(self, messages: list, max_msgs: int = 10,
                              per_msg: int = 300, total: int = 2000) -> str:
-        """把消息列表渲染成 JEV state 文本（昵称: 内容；媒体占位；从旧侧丢，保最新）。"""
+        """把消息列表渲染成 JEV state 文本（身份: 内容；媒体占位；从旧侧丢，保最新）。"""
         lines = []
         for m in messages[-max_msgs:]:
             try:
-                nick = getattr(getattr(m, "sender", None), "nickname", "") or "?"
                 text = self._render_chain_for_jev(getattr(m, "chain", None), per_msg)
                 if text:
-                    lines.append(f"[{nick}] {text}")
+                    lines.append(f"[{self._jev_sender_label(m)}] {text}")
             except Exception:
                 continue
         out = "\n".join(lines)
@@ -1253,7 +1290,10 @@ class DebouncePlugin(BasePlugin):
                             # 无游标回落时，排除比本批更新的记录（判定期间新到的）
                             if newest_ts and _safe_int(getattr(rec, "timestamp", 0), 0) > newest_ts:
                                 continue
-                            speaker = getattr(rec, "sender_name", None) or "?"
+                            # 档案表只存 sender_name（无群名片列）：这里只能给
+                            # user_nickname；群名片要等框架把 group_nickname 落库。
+                            _name = _safe_display_name(getattr(rec, "sender_name", None))
+                            speaker = f"user_nickname: {_name}" if _name else "?"
                         elif direction == "outgoing":
                             if getattr(rec, "status", "") != "sent":
                                 continue
@@ -1283,10 +1323,9 @@ class DebouncePlugin(BasePlugin):
                     mts = _safe_int(getattr(m, "timestamp", 0), 0)
                     if newest_ts and mts > newest_ts:
                         continue
-                    nick = getattr(getattr(m, "sender", None), "nickname", "") or "?"
                     text = self._render_chain_for_jev(getattr(m, "chain", None))
                     if text:
-                        lines.append(f"[{nick}] {text}")
+                        lines.append(f"[{self._jev_sender_label(m)}] {text}")
             except Exception:
                 return ""
         if not lines:

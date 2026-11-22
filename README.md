@@ -1,4 +1,4 @@
-# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.11.1
+# KiraAI_Default-Chat-Z- 默认消息处理插件优化版 v1.11.3
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_Default-Chat-Z-)
 
@@ -33,6 +33,13 @@
 
 <details>
 <summary>更新日志</summary>
+
+### v1.11.3
+
+- **3.3.0 群昵称对齐**：JEV 决策上下文（本批消息 / 缓冲回落 / 消息档案）不再只写一个昵称，改为与官方群消息一致的身份字段 `user_nickname: N, group_nickname: C`；群名片与昵称相同时自动去重，私聊不输出群名片。
+- **边界**：消息档案表（`message_history`）没有群名片列，档案路径只能给 `user_nickname`，其余路径正常；不修改任何 system prompt 或工具 schema，主对话的缓存前缀保持不变。名字会压单行，含 `[` / `]` 时方括号与 `|` 转全角，防止伪造 state 行。
+- **回归**：`test_jev_decisions` 增加名片 / 同名 / 私聊 / 无名片 / 换行注入五种断言；真实框架 3.3.0 加载 10/10。
+- 版本 1.11.2 → 1.11.3
 
 ### v1.11.2
 
