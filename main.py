@@ -10,7 +10,6 @@ import sys
 import time
 import wave
 import xml.etree.ElementTree as ET
-from collections import defaultdict
 from typing import Optional
 
 # 插件管理器用 spec_from_file_location 加载 main.py，不会把插件目录加入 sys.path；
@@ -22,7 +21,7 @@ if _PLUGIN_DIR not in sys.path:
 # 热重载只重新 import main.py，sys.modules 里缓存的同目录模块不会更新；
 # 强制重载，避免改了 queue_merge / media_recognize / chat_enhance / jev 后热重载不生效
 import importlib
-for _m in ("adaptive_merge", "media_access", "queue_merge", "media_recognize", "chat_enhance", "jev"):
+for _m in ("adaptive_merge", "forward_raw", "media_access", "queue_merge", "media_recognize", "chat_enhance", "jev"):
     if _m in sys.modules:
         try:
             importlib.reload(sys.modules[_m])
@@ -408,6 +407,7 @@ class DebouncePlugin(BasePlugin):
                 "max_duration": _sec(f"section_{_kind}", _k + "max_duration", 300),
                 "scope": _sec(f"section_{_kind}", _k + "scope", "per_user"),
             }
+        _enhance_cfg["section_ignore"] = cfg.get("section_ignore", {}) or {}
         self.enhance = ChatEnhanceEngine(ctx, _enhance_cfg, self, merge_seconds=self._current_merge_window)
 
         # ignore/wake_extend tag 的会话上下文：sid -> (token, timestamp)。
@@ -460,7 +460,7 @@ class DebouncePlugin(BasePlugin):
         self._jev_bg_tasks: set = set()
 
     async def initialize(self):
-        logger.info(f"[Debounce] enabled (group media/forward/voice control, private unchanged)")
+        logger.info("[Debounce] enabled (group media/forward/voice control, private unchanged)")
         if self.jev_enabled:
             logger.info(
                 f"[JEV] 触发决策已启用: proactive={self.jev_proactive_mode}, "
@@ -798,6 +798,7 @@ class DebouncePlugin(BasePlugin):
         sid = self._consume_ignore_sid()
         if sid is None:
             return []
+        self._refresh_harass_hot()
         result = self.enhance.harass.apply_ignore_from_tag(sid, kind, value)
         if result:
             logger.info(f"[Enhance] {kind} 屏蔽: {result}")
@@ -841,6 +842,7 @@ class DebouncePlugin(BasePlugin):
     async def manage_ignore(self, event, action: str, target_type: str, target_id: str = "",
                             block_type: str = "all", duration: int = 0) -> str:
         """bot 主动管理骚扰屏蔽。"""
+        self._refresh_harass_hot()
         try:
             sid = str(event.session.sid)
         except Exception:
@@ -1544,12 +1546,27 @@ class DebouncePlugin(BasePlugin):
                             elem._media_skip_reason = "mention"
                         else:
                             chain.message_list[i] = Text("[Image attached]")
+                    elif not is_mentioned and random.random() >= self.image_recognition_probability:
+                        # native 没有 VLM 成本，但概率设置仍是用户明确配置：
+                        # 命中失败时要么交给按需图片工具，要么占位拦直传。
+                        if self.media_recognizer.access.image_tool_enabled:
+                            elem._media_skip = True
+                            elem._media_skip_reason = "probability"
+                        else:
+                            chain.message_list[i] = Text("[Image attached]")
                 elif isinstance(elem, Sticker):
                     if (self.image_recognition_only_on_mention and self.native_sticker_follow_mention
                             and not is_mentioned):
                         if self.media_recognizer.access.image_tool_enabled:
                             elem._media_skip = True
                             elem._media_skip_reason = "mention"
+                        else:
+                            chain.message_list[i] = Text("[Sticker attached]")
+                    elif (not is_mentioned and self.native_sticker_follow_mention
+                          and random.random() >= self.image_recognition_probability):
+                        if self.media_recognizer.access.image_tool_enabled:
+                            elem._media_skip = True
+                            elem._media_skip_reason = "probability"
                         else:
                             chain.message_list[i] = Text("[Sticker attached]")
                 elif isinstance(elem, Forward):
@@ -1594,7 +1611,20 @@ class DebouncePlugin(BasePlugin):
         duration = await self._get_record_duration(elem)
         # 长语音限制
         if self.voice_max_duration > 0 and duration > self.voice_max_duration:
-            chain.message_list[i] = Text(f"[长语音 {duration}秒]")
+            # 超长语音永远只是占位：不自动 STT，也不允许 read_media 按需 STT。
+            # 保留 Record 到 media_recognize 的 stage1，仅用于后台落盘拿 file_path；
+            # stage1 会把它换成 [长语音 X秒(, file_path: ...)] 且不进入 STT。
+            elem._long_voice_seconds = duration
+            elem._media_skip = True
+            elem._media_skip_reason = "duration"
+            if not self.media_recognizer.enabled:
+                # 媒体识别总开关关闭时不会走 stage1，直接占位防框架自动 STT。
+                path = getattr(elem, "_temp_path", None)
+                if not path and getattr(elem, "file_type", "") == "path":
+                    path = getattr(elem, "file", None)
+                chain.message_list[i] = Text(
+                    f"[长语音 {duration}秒, file_path: {path}]" if path
+                    else f"[长语音 {duration}秒]")
             return
         # 决定是否尝试识别语音
         should_try_stt = False
@@ -1610,6 +1640,12 @@ class DebouncePlugin(BasePlugin):
                 should_try_stt = True
         if should_try_stt:
             pass  # 保留原始语音元素，由 media_recognize 并行 STT（限流+缓存）
+        elif self.media_recognizer.access.audio_tool_enabled:
+            # 按需语音工具开启：保留 Record 元素并标记本次不自动识别，让
+            # media_recognize 换成 [Record #id: 可读取]，LLM 可随时 read_media。
+            # 若这里直接替换成 [语音]，read_media 将永远拿不到源元素。
+            elem._media_skip = True
+            elem._media_skip_reason = "private" if is_private else "mention"
         else:
             chain.message_list[i] = Text("[语音]")
 
@@ -1624,23 +1660,73 @@ class DebouncePlugin(BasePlugin):
         if len(media_indices) <= max_count:
             return
         if self.media_recognizer._native_mode():
-            # native：超限 Image 替换为官方占位 [Image attached]；超限 Sticker 仅在
-            # native_sticker_follow_mention 开启时占位（[Sticker attached]，代价是复读
-            # 不正确），否则保留（复读真表情包优先）
+            # native：超限 Image 默认替换为占位拦直传；但按需图片工具开启时
+            # 保留元素并打 _media_skip，交给 read_media 读取——否则工具化配置
+            # 下超限图片会永久失去源元素。Sticker 同理，且仅在
+            # native_sticker_follow_mention 开启时参与占位。
+            tool = self.media_recognizer.access.image_tool_enabled
             for idx in reversed(media_indices[max_count:]):
                 elem = chain.message_list[idx]
-                if isinstance(elem, Image):
-                    chain.message_list[idx] = Text("[Image attached]")
-                elif self.native_sticker_follow_mention:
-                    chain.message_list[idx] = Text("[Sticker attached]")
+                if isinstance(elem, Image) or (
+                        isinstance(elem, Sticker) and self.native_sticker_follow_mention):
+                    if tool:
+                        elem._media_skip = True
+                        elem._media_skip_reason = "cap"
+                    else:
+                        chain.message_list[idx] = Text(
+                            "[Sticker attached]" if isinstance(elem, Sticker)
+                            else "[Image attached]")
             return
         for idx in reversed(media_indices[max_count:]):
             chain.message_list[idx]._media_skip = True
             chain.message_list[idx]._media_skip_reason = "cap"
             chain.message_list[idx].caption = ""  # 阻止框架渲染时自动 VLM
 
+    def _live_plugin_cfg(self):
+        """读取 PluginManager 当前内存配置（WebUI 保存后无需重启即可生效）。"""
+        try:
+            mgr = getattr(self.ctx, "plugin_mgr", None)
+            configs = getattr(mgr, "plugin_configs", None) if mgr is not None else None
+            if isinstance(configs, dict):
+                live = configs.get(_SELF_PLUGIN_ID)
+                if isinstance(live, dict):
+                    return live
+        except Exception:
+            pass
+        return self.plugin_cfg
+
+    def _refresh_harass_hot(self):
+        try:
+            cfg = dict(self._live_plugin_cfg())
+            hscope = cfg.get("section_harass_scope", {}) or {}
+            for key in ("harass_scope_sessions", "harass_whitelist_users",
+                        "harass_whitelist_sessions"):
+                if key in hscope:
+                    cfg[key] = hscope[key]
+            thresholds = cfg.get("section_thresholds", {}) or {}
+            for key in ("extra_default_duration", "extra_max_duration",
+                        "extra_allow_bot_duration"):
+                if key in thresholds:
+                    cfg[key] = thresholds[key]
+            self.enhance.harass.reload(cfg)
+            # 通知文案用到的 extra/all 参数同步刷新（保留检测计数）
+            self.enhance.extra_default_duration = _safe_int(
+                cfg.get("extra_default_duration"), self.enhance.extra_default_duration)
+            self.enhance.extra_max_duration = _safe_int(
+                cfg.get("extra_max_duration"), self.enhance.extra_max_duration)
+            self.enhance.extra_allow_bot_duration = bool(
+                cfg.get("extra_allow_bot_duration", self.enhance.extra_allow_bot_duration))
+            detect = cfg.get("section_detect", {}) or {}
+            if "bot_speech_block_session" in detect:
+                self.enhance.bot_speech_block_session = bool(
+                    detect["bot_speech_block_session"])
+        except Exception:
+            pass
+
     @on.im_message(priority=Priority.HIGH)
     async def handle_msg(self, event: KiraMessageEvent, *_):
+        # 骚扰/白名单/完整拉黑配置热更新（保留已有计数与屏蔽状态）
+        self._refresh_harass_hot()
         # === 过滤机器人自己的消息（群聊/私聊一致）===
         # 适配器会把 bot 自己发出的消息也作为普通消息事件送达（取决于实现/配置，例如
         # NapCat 的 reportSelfMessage），其 message.self_id 与 sender.user_id 相同。
