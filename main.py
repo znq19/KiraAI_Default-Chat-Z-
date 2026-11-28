@@ -1611,12 +1611,20 @@ class DebouncePlugin(BasePlugin):
         duration = await self._get_record_duration(elem)
         # 长语音限制
         if self.voice_max_duration > 0 and duration > self.voice_max_duration:
-            if self.media_recognizer.access.audio_tool_enabled:
-                # 按需语音工具开启：超长语音不自动 STT，但保留源元素供 read_media。
-                elem._media_skip = True
-                elem._media_skip_reason = "duration"
-            else:
-                chain.message_list[i] = Text(f"[长语音 {duration}秒]")
+            # 超长语音永远只是占位：不自动 STT，也不允许 read_media 按需 STT。
+            # 保留 Record 到 media_recognize 的 stage1，仅用于后台落盘拿 file_path；
+            # stage1 会把它换成 [长语音 X秒(, file_path: ...)] 且不进入 STT。
+            elem._long_voice_seconds = duration
+            elem._media_skip = True
+            elem._media_skip_reason = "duration"
+            if not self.media_recognizer.enabled:
+                # 媒体识别总开关关闭时不会走 stage1，直接占位防框架自动 STT。
+                path = getattr(elem, "_temp_path", None)
+                if not path and getattr(elem, "file_type", "") == "path":
+                    path = getattr(elem, "file", None)
+                chain.message_list[i] = Text(
+                    f"[长语音 {duration}秒, file_path: {path}]" if path
+                    else f"[长语音 {duration}秒]")
             return
         # 决定是否尝试识别语音
         should_try_stt = False
