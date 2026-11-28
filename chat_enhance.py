@@ -1034,6 +1034,7 @@ class ChatEnhanceEngine:
     def _build_extra_notice(self, kind: str, user_id: str, n: int, window: float, threshold: int) -> str:
         """额外信号通知。时长建议动态取配置允许的最大值（extra_max_duration，未启钳制时
         回落 extra_default_duration）；不教 -1（永久仅在 hint 中说明，避免绕过钳制）。
+        完整拉黑的建议时长取 section_ignore（与单项 extra 配置分离）。
         bot_speech 且 bot_speech_block_session 开启：建议会话级拉黑标签（<ignore>all|...>），
         输入即拉黑当前会话；关闭则仅提醒。user_msgs/session_msgs 仍教定向/全拉黑两选项。
         """
